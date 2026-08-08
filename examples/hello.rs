@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stack = Stack::new(identity);
 
-    let sock = stack.udp_bind(7878)?;
+    let sock = stack.udp_bind(7878.into())?;
 
     loop {
         stack.poll(&mut device)?;

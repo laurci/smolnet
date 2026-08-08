@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stack = Stack::new(identity);
 
-    let sock = stack.udp_bind(55674)?;
+    let sock = stack.udp_bind(None)?;
 
     let mut req_ntp = [0u8; 48];
     req_ntp[0] = 0x1b;
@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         stack.poll(&mut device)?;
 
         while let Some((addr, port, data)) = stack.udp_recv(&sock) {
+            // we could parse ntp time here.
             tracing::info!("udp recv {:?} {} {:?}", addr, port, data);
         }
 

@@ -17,6 +17,9 @@ use crate::{
     },
 };
 
+const EPHEMERAL_PORT_START: u16 = 50000;
+const EPHEMERAL_PORT_END: u16 = 60999;
+
 #[derive(Debug, Error)]
 pub enum StackError {
     #[error("device reported error while processing frame:\n{0}")]
@@ -55,6 +58,8 @@ pub struct Stack {
     identity: StackIdentity,
     arp_cache: ArpCache,
 
+    next_ephemeral_port: u16,
+
     pending_arp_ipv4: Vec<Ipv4Frame>,
     inflight_arp_ipv4: HashSet<Ipv4Addr>,
 
@@ -70,6 +75,8 @@ impl Stack {
         Stack {
             identity,
             arp_cache,
+
+            next_ephemeral_port: rand::random_range(EPHEMERAL_PORT_START..=EPHEMERAL_PORT_END),
 
             pending_arp_ipv4: vec![],
             inflight_arp_ipv4: HashSet::new(),
@@ -168,6 +175,15 @@ impl Stack {
         self.egress_queue.len() > 0 || self.udp_engine.has_work()
     }
 
+    fn alloc_ephemeral_port(&mut self) -> u16 {
+        self.next_ephemeral_port += 1;
+        if self.next_ephemeral_port > EPHEMERAL_PORT_END {
+            self.next_ephemeral_port = EPHEMERAL_PORT_START;
+        };
+
+        self.next_ephemeral_port
+    }
+
     fn queue_egress_frame(&mut self, frame: &[u8]) {
         self.egress_queue.push_back(frame.to_owned());
     }
@@ -230,7 +246,8 @@ impl Stack {
         Ok(())
     }
 
-    pub fn udp_bind(&mut self, port: u16) -> Result<UdpSocketHandle, UdpSocketBindError> {
+    pub fn udp_bind(&mut self, port: Option<u16>) -> Result<UdpSocketHandle, UdpSocketBindError> {
+        let port = port.unwrap_or_else(|| self.alloc_ephemeral_port());
         self.udp_engine.bind(port)
     }
 
