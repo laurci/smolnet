@@ -1,0 +1,16 @@
+[package]
+name = "smolnet"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["net_header", "net_header/meta", "."]
+
+[dependencies]
+net_header = { path = "./net_header" }
+nix = { version = "0.31.3", features = ["ioctl", "poll", "fs"] }
+thiserror = "2.0.19"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.23"

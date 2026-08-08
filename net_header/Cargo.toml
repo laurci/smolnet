@@ -1,0 +1,10 @@
+[package]
+name = "net_header"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+meta = { path = "./meta" }
+thiserror = "2.0.19"
+tracing = "0.1.44"
