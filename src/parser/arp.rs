@@ -1,4 +1,4 @@
-use net_header::{NetHeader, parse::HeaderParseError, write::HeaderWriteError};
+use net_header::{NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
 use crate::{
@@ -111,15 +111,14 @@ impl ArpFrame {
         ArpFrame { operation }
     }
 
-    pub fn write(self, bytes: &mut [u8]) -> Result<usize, HeaderWriteError> {
+    pub fn write(self, bytes: &mut [u8]) -> usize {
         let header = match self.operation {
             ArpOperation::Request(req) => req.header,
             ArpOperation::Reply(reply) => reply.header,
         };
 
-        let size = header.write(bytes)?;
-
-        Ok(size)
+        let size = header.write(bytes);
+        size
     }
 }
 
@@ -235,7 +234,7 @@ mod test {
         );
 
         let mut sent_bytes = [0u8; EthernetHeader::SIZE + ArpHeader::SIZE];
-        let sent_size = sent_frame.clone().write(&mut sent_bytes).unwrap();
+        let sent_size = sent_frame.clone().write(&mut sent_bytes);
         assert_eq!(sent_size, sent_bytes.len());
 
         let recv_frame = EthernetFrame::parse(&sent_bytes).unwrap();
@@ -256,7 +255,7 @@ mod test {
         );
 
         let mut sent_bytes = [0u8; EthernetHeader::SIZE + ArpHeader::SIZE];
-        let sent_size = sent_frame.clone().write(&mut sent_bytes).unwrap();
+        let sent_size = sent_frame.clone().write(&mut sent_bytes);
         assert_eq!(sent_size, sent_bytes.len());
 
         let recv_frame = EthernetFrame::parse(&sent_bytes).unwrap();

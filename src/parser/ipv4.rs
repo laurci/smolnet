@@ -1,9 +1,13 @@
-use net_header::{NetHeader, parse::HeaderParseError, write::HeaderWriteError};
+use net_header::{NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
 use crate::{
     addr::Ipv4Addr,
-    parser::icmp::{IcmpFrame, IcmpFrameParseError},
+    device::MAX_FRAME_SIZE,
+    parser::{
+        icmp::{IcmpFrame, IcmpFrameParseError},
+        udp::{UdpFrame, UdpFrameParseError},
+    },
     stack::StackIdentity,
 };
 
@@ -62,16 +66,26 @@ pub enum Ipv4FrameParseError {
     #[error("invalid payload let from ipv4 header: {0}")]
     InvalidPayloadLen(u16),
 
+    #[error("invalid payload (udp) checksum for ipv4 header {0}")]
+    InvalidUdpPayloadChecksum(u16),
+
+    #[error("invalid payload (tcp) checksum for ipv4 header {0}")]
+    InvalidTcpPayloadChecksum(u16),
+
     #[error("unknown ipv4 protocol {0:x}")]
     UnknownProtocol(u8),
 
     #[error("failed to parse icmp frame:\n{0}")]
     IcmpFrameParseError(IcmpFrameParseError),
+
+    #[error("failed to parse udp frame:\n{0}")]
+    UdpFrameParseError(UdpFrameParseError),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Ipv4Payload {
     ICMP(IcmpFrame),
+    UDP(UdpFrame),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -122,8 +136,21 @@ impl Ipv4Frame {
                 return Err(Ipv4FrameParseError::UnknownProtocol(IPV4_PROTOCOL_TCP));
             }
             IPV4_PROTOCOL_UDP => {
-                tracing::warn!("udp is not implemented");
-                return Err(Ipv4FrameParseError::UnknownProtocol(IPV4_PROTOCOL_UDP));
+                let checksum = pseudo_header_checksum(
+                    &header.src_addr,
+                    &header.dst_addr,
+                    IPV4_PROTOCOL_UDP,
+                    &payload_bytes,
+                );
+
+                let frame = UdpFrame::parse(payload_bytes)
+                    .map_err(|e| Ipv4FrameParseError::UdpFrameParseError(e))?;
+
+                if !frame.validate_checksum(checksum) {
+                    return Err(Ipv4FrameParseError::InvalidUdpPayloadChecksum(checksum));
+                }
+
+                Ipv4Payload::UDP(frame)
             }
             unknown_value => return Err(Ipv4FrameParseError::UnknownProtocol(unknown_value)),
         };
@@ -133,19 +160,44 @@ impl Ipv4Frame {
         Ok(frame)
     }
 
-    pub fn write(self, bytes: &mut [u8]) -> Result<usize, HeaderWriteError> {
-        let size = self.header.write(bytes)?;
+    pub fn write(self, bytes: &mut [u8]) -> usize {
+        let size = self.header.write(bytes);
 
+        let src = self.src().clone();
+        let dst = self.dst().clone();
         let payload_size = match self.payload {
-            Ipv4Payload::ICMP(frame) => frame.write(&mut bytes[Ipv4Header::SIZE..])?,
+            Ipv4Payload::ICMP(frame) => frame.write(&mut bytes[Ipv4Header::SIZE..]),
+            Ipv4Payload::UDP(frame) => {
+                let size = frame.write(&mut bytes[Ipv4Header::SIZE..]);
+
+                let end = Ipv4Header::SIZE + size;
+
+                let mut checksum = pseudo_header_checksum(
+                    &src,
+                    &dst,
+                    IPV4_PROTOCOL_UDP,
+                    &bytes[Ipv4Header::SIZE..end],
+                );
+
+                if checksum == 0 {
+                    checksum = 0xffff;
+                }
+
+                let checksum_offset = Ipv4Header::SIZE + UdpFrame::CHECKSUM_OFFSET;
+                bytes[checksum_offset..checksum_offset + 2]
+                    .copy_from_slice(&checksum.to_be_bytes());
+
+                size
+            }
         };
 
-        Ok(size + payload_size)
+        size + payload_size
     }
 
     pub fn new(src: Ipv4Addr, dst: Ipv4Addr, payload: Ipv4Payload) -> Ipv4Frame {
         let (protocol, payload_size) = match &payload {
-            Ipv4Payload::ICMP(frame) => (IPV4_PROTOCOL_ICMP, frame.size()), // TODO: when ICMP implemented
+            Ipv4Payload::ICMP(frame) => (IPV4_PROTOCOL_ICMP, frame.size()),
+            Ipv4Payload::UDP(frame) => (IPV4_PROTOCOL_UDP, frame.size()),
         };
 
         let header = Ipv4Header {
@@ -181,6 +233,28 @@ impl Ipv4Frame {
     }
 }
 
+pub fn pseudo_header_checksum(
+    src_addr: &Ipv4Addr,
+    dst_addr: &Ipv4Addr,
+    protocol: u8,
+    data: &[u8],
+) -> u16 {
+    const PSEUDO_HEADER_SIZE: usize = 12;
+    let mut buffer = [0u8; MAX_FRAME_SIZE + PSEUDO_HEADER_SIZE];
+
+    buffer[0..4].copy_from_slice(src_addr);
+    buffer[4..8].copy_from_slice(dst_addr);
+    buffer[8] = 0x00;
+    buffer[9] = protocol;
+
+    buffer[10..12].copy_from_slice(&(data.len() as u16).to_be_bytes());
+
+    let end = data.len() + PSEUDO_HEADER_SIZE;
+    buffer[12..end].copy_from_slice(data);
+
+    net_header::checksum(&buffer[..end])
+}
+
 #[cfg(test)]
 mod test {
     use net_header::NetHeader;
@@ -203,7 +277,7 @@ mod test {
         };
 
         let mut bytes = [0u8; Ipv4Header::SIZE];
-        let size = header.write(&mut bytes).unwrap();
+        let size = header.write(&mut bytes);
         assert_eq!(bytes.len(), size);
 
         let checksum = net_header::checksum(&bytes);

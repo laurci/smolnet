@@ -3,7 +3,7 @@ pub mod write;
 
 mod checksum;
 
-use crate::{parse::HeaderParseError, write::HeaderWriteError};
+use crate::parse::HeaderParseError;
 pub use meta::NetHeader;
 
 pub use checksum::checksum;
@@ -13,5 +13,5 @@ pub trait NetHeader: Sized {
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, HeaderParseError>;
 
-    fn write(&self, bytes: &mut [u8]) -> Result<usize, HeaderWriteError>;
+    fn write(&self, bytes: &mut [u8]) -> usize;
 }

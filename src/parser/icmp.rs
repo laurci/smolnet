@@ -1,4 +1,4 @@
-use net_header::{NetHeader, parse::HeaderParseError, write::HeaderWriteError};
+use net_header::{NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
 const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
@@ -65,15 +65,15 @@ impl IcmpFrame {
         Ok(frame)
     }
 
-    pub fn write(self, bytes: &mut [u8]) -> Result<usize, HeaderWriteError> {
-        let hdr_size = self.header.write(bytes)?;
+    pub fn write(self, bytes: &mut [u8]) -> usize {
+        let hdr_size = self.header.write(bytes);
         let end = hdr_size + self.payload.len();
         bytes[hdr_size..end].copy_from_slice(&self.payload);
 
         let checksum = net_header::checksum(&bytes[..end]);
-        net_header::write::write_field_u16(checksum, "icmp.checksum", bytes, 2)?;
+        net_header::write::write_field_u16(checksum, "icmp.checksum", bytes, 2);
 
-        Ok(end)
+        end
     }
 
     pub fn new(type_: IcmpType, payload: &[u8]) -> IcmpFrame {

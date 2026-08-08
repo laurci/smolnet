@@ -3,7 +3,7 @@ use crate::{
     stack::StackIdentity,
 };
 
-pub fn process_icmp_frame(_identity: &StackIdentity, icmp_frame: &IcmpFrame) -> Option<IcmpFrame> {
+pub fn process_frame(_identity: &StackIdentity, icmp_frame: &IcmpFrame) -> Option<IcmpFrame> {
     if icmp_frame.type_() != &IcmpType::EchoRequest {
         return None;
     }

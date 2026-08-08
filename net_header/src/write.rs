@@ -1,35 +1,19 @@
-use thiserror::Error;
-
-#[derive(Error, Debug, PartialEq, Eq)]
-pub enum HeaderWriteError {
-    #[error(
-        "insufficient space in buffer while writing field '{field_name}' (needed = {needed_length}; remaining = {remaining_length})"
-    )]
-    BufferLenghtForField {
-        field_name: &'static str,
-        needed_length: usize,
-        remaining_length: usize,
-    },
-}
-
 pub fn write_field_slice<const N: usize>(
     data: [u8; N],
     field_name: &'static str,
     output: &mut [u8],
     offset: usize,
-) -> Result<usize, HeaderWriteError> {
+) -> usize {
     let end = offset + N;
-    if end > output.len() {
-        return Err(HeaderWriteError::BufferLenghtForField {
-            field_name,
-            needed_length: N,
-            remaining_length: output.len() - offset,
-        });
-    }
+    debug_assert!(
+        end <= output.len(),
+        "insufficient buffer size when writing '{field_name}'; needs = {N}, got = {}",
+        output.len() - offset
+    );
 
     output[offset..end].copy_from_slice(&data);
 
-    Ok(end)
+    end
 }
 
 macro_rules! impl_write_field_numeric {
@@ -40,7 +24,7 @@ macro_rules! impl_write_field_numeric {
                 field_name: &'static str,
                 output: &mut [u8],
                 offset: usize,
-            ) -> Result<usize, HeaderWriteError> {
+            ) -> usize {
                 let bytes = data.to_be_bytes();
                 write_field_slice(bytes, field_name, output, offset)
             }

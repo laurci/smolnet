@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use smolnet::{
-    device::{Device, tap::TapDevice},
+    device::tap::TapDevice,
     stack::{Stack, StackIdentity},
 };
 
@@ -17,8 +17,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stack = Stack::new(identity);
 
+    let sock = stack.udp_bind(7878)?;
+
     loop {
         stack.poll(&mut device)?;
-        device.wait(None, stack.has_pending_egress())?;
+
+        while let Some((addr, port, data)) = stack.udp_recv(&sock) {
+            let text = String::from_utf8_lossy(&data);
+            let reply = format!("reply: {}\n", text.trim());
+            stack.udp_send(&sock, addr, port, reply.into_bytes());
+        }
+
+        stack.wait(&mut device)?;
     }
 }

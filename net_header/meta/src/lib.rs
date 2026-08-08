@@ -216,7 +216,7 @@ fn gen_encoder_for_field(
     let (impl_, advance) = match field_info {
         HeaderFieldInfo::Slice { size } => (
             quote! {
-                let offset = ::net_header::write::write_field_slice(self.#field_ident, #field_name, bytes, #offset)?;
+                let offset = ::net_header::write::write_field_slice(self.#field_ident, #field_name, bytes, #offset);
             },
             size,
         ),
@@ -228,7 +228,7 @@ fn gen_encoder_for_field(
 
             (
                 quote! {
-                    let offset = ::net_header::write::#write_method_name(self.#field_ident, #field_name, bytes, #offset)?;
+                    let offset = ::net_header::write::#write_method_name(self.#field_ident, #field_name, bytes, #offset);
                 },
                 info.bytes,
             )
@@ -238,7 +238,7 @@ fn gen_encoder_for_field(
 
             (
                 quote! {
-                    let offset = ::net_header::write::write_field_u16(0, #field_name, bytes, #offset)?;
+                    let offset = ::net_header::write::write_field_u16(0, #field_name, bytes, #offset);
                 },
                 2,
             )
@@ -294,7 +294,7 @@ pub fn net_header_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStr
     let checksum_writeback_impl = match encoder_gen_state.checksum_offset {
         Some(checksum_offset) => quote! {
             let computed_checksum__ = ::net_header::checksum(&bytes[..offset]);
-            ::net_header::write::write_field_u16(computed_checksum__, #checksum_writeback_name, bytes, #checksum_offset)?;
+            ::net_header::write::write_field_u16(computed_checksum__, #checksum_writeback_name, bytes, #checksum_offset);
         },
         None => quote! {},
     };
@@ -313,12 +313,12 @@ pub fn net_header_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStr
                 Ok(header)
             }
 
-            fn write(&self, bytes: &mut [u8]) -> Result<usize, ::net_header::write::HeaderWriteError> {
+            fn write(&self, bytes: &mut [u8]) -> usize {
                 #( #encoder_field_impls )*
 
                 #checksum_writeback_impl
 
-                Ok(offset)
+                offset
             }
         }
     };

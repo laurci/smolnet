@@ -8,8 +8,12 @@ use crate::{
     handler::{
         arp::{self, ArpCache},
         ipv4,
+        udp::{UdpEngine, UdpSocketBindError, UdpSocketHandle},
     },
-    parser::ethernet::{EthernetFrame, EthernetFrameParseEerror, EthernetPayload},
+    parser::{
+        ethernet::{EthernetFrame, EthernetFrameParseEerror, EthernetPayload},
+        ipv4::{Ipv4Frame, Ipv4Payload},
+    },
 };
 
 #[derive(Debug, Error)]
@@ -34,16 +38,19 @@ pub struct Stack {
     identity: StackIdentity,
     arp_cache: ArpCache,
     egress_queue: VecDeque<Vec<u8>>,
+    udp_engine: UdpEngine,
 }
 
 impl Stack {
     pub fn new(identity: StackIdentity) -> Stack {
         let arp_cache = ArpCache::default();
+        let udp_engine = UdpEngine::default();
 
         Stack {
             identity,
             arp_cache,
             egress_queue: VecDeque::new(),
+            udp_engine,
         }
     }
 
@@ -67,6 +74,20 @@ impl Stack {
             }
         };
 
+        let udp_frames = self.udp_engine.drain_tx_queues();
+        for (dst_ip, frames) in udp_frames {
+            let Some(dst_mac) = self.arp_cache.lookup(&dst_ip).cloned() else {
+                continue;
+            };
+
+            for frame in frames {
+                let frame = Ipv4Frame::new(self.identity.ip, dst_ip, Ipv4Payload::UDP(frame));
+                let frame =
+                    EthernetFrame::new(self.identity.mac, dst_mac, EthernetPayload::Ipv4(frame));
+                self.queue_egress_eth_frame(frame);
+            }
+        }
+
         if let Err(flush_error) = self.flush_egress(device) {
             if output.is_err() {
                 tracing::warn!("device error while flushing egress queue {flush_error}");
@@ -76,6 +97,18 @@ impl Stack {
         }
 
         output
+    }
+
+    pub fn wait<D: Device>(&mut self, device: &mut D) -> Result<(), StackError> {
+        if self.has_work() {
+            return Ok(());
+        }
+
+        device
+            .wait(None, self.has_pending_egress())
+            .map_err(|e| StackError::DeviceError(e))?;
+
+        Ok(())
     }
 
     fn flush_egress<D: Device>(&mut self, device: &mut D) -> Result<(), DeviceError> {
@@ -95,8 +128,12 @@ impl Stack {
         Ok(())
     }
 
-    pub fn has_pending_egress(&self) -> bool {
+    fn has_pending_egress(&self) -> bool {
         self.egress_queue.len() > 0
+    }
+
+    fn has_work(&self) -> bool {
+        self.egress_queue.len() > 0 || self.udp_engine.has_work()
     }
 
     fn queue_egress_frame(&mut self, frame: &[u8]) {
@@ -107,13 +144,11 @@ impl Stack {
         let mut write_buf = [0u8; MAX_FRAME_SIZE];
 
         let size = frame.write(&mut write_buf);
-        debug_assert!(size.is_ok(), "failed to serialize eth frame for egress");
-        let size = size.expect("failed to serialize eth frame for egress");
 
         self.queue_egress_frame(&write_buf[..size]);
     }
 
-    pub fn process_frame(&mut self, frame: &[u8]) -> Result<(), StackFrameProcessError> {
+    fn process_frame(&mut self, frame: &[u8]) -> Result<(), StackFrameProcessError> {
         let eth_frame = EthernetFrame::parse(frame)
             .map_err(|e| StackFrameProcessError::EthernetFrameParseEerror(e))?;
 
@@ -127,7 +162,7 @@ impl Stack {
                 }
             }
             EthernetPayload::Ipv4(ipv4_frame) => {
-                let frames = ipv4::process_frame(&self.identity, ipv4_frame);
+                let frames = ipv4::process_frame(&self.identity, &mut self.udp_engine, ipv4_frame);
                 for frame in frames {
                     let frame = eth_frame.reply(&self.identity, EthernetPayload::Ipv4(frame));
                     self.queue_egress_eth_frame(frame);
@@ -136,6 +171,24 @@ impl Stack {
         }
 
         Ok(())
+    }
+
+    pub fn udp_bind(&mut self, port: u16) -> Result<UdpSocketHandle, UdpSocketBindError> {
+        self.udp_engine.bind(port)
+    }
+
+    pub fn udp_recv(&mut self, handle: &UdpSocketHandle) -> Option<(Ipv4Addr, u16, Vec<u8>)> {
+        self.udp_engine.recv(handle)
+    }
+
+    pub fn udp_send(
+        &mut self,
+        handle: &UdpSocketHandle,
+        dst_addr: Ipv4Addr,
+        dst_port: u16,
+        payload: Vec<u8>,
+    ) {
+        self.udp_engine.send(handle, dst_addr, dst_port, payload);
     }
 }
 

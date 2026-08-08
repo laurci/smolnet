@@ -26,10 +26,7 @@ impl MockDevice {
 
     pub fn push_rx_eth_frame(&mut self, frame: &EthernetFrame) {
         let mut buffer = [0u8; MAX_FRAME_SIZE];
-        let size = frame
-            .clone()
-            .write(&mut buffer)
-            .expect("failed to serialize ethernet frame");
+        let size = frame.clone().write(&mut buffer);
         self.push_rx_frame(&buffer[..size]);
     }
 

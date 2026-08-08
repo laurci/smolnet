@@ -1,4 +1,4 @@
-use net_header::{NetHeader, parse::HeaderParseError, write::HeaderWriteError};
+use net_header::{NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
 use crate::{
@@ -75,15 +75,15 @@ impl EthernetFrame {
         Ok(frame)
     }
 
-    pub fn write(self, bytes: &mut [u8]) -> Result<usize, HeaderWriteError> {
-        let size = self.header.write(bytes)?;
+    pub fn write(self, bytes: &mut [u8]) -> usize {
+        let size = self.header.write(bytes);
 
         let payload_size = match self.payload {
-            EthernetPayload::Arp(frame) => frame.write(&mut bytes[EthernetHeader::SIZE..])?,
-            EthernetPayload::Ipv4(frame) => frame.write(&mut bytes[EthernetHeader::SIZE..])?,
+            EthernetPayload::Arp(frame) => frame.write(&mut bytes[EthernetHeader::SIZE..]),
+            EthernetPayload::Ipv4(frame) => frame.write(&mut bytes[EthernetHeader::SIZE..]),
         };
 
-        Ok(size + payload_size)
+        size + payload_size
     }
 
     pub fn new(src: MacAddr, dst: MacAddr, payload: EthernetPayload) -> EthernetFrame {
@@ -116,7 +116,7 @@ impl EthernetFrame {
 
 #[cfg(test)]
 mod test {
-    use net_header::{NetHeader, write::HeaderWriteError};
+    use net_header::NetHeader;
 
     use crate::parser::ethernet::EthernetHeader;
 
@@ -140,7 +140,7 @@ mod test {
         };
 
         let mut bytes = [0u8; EthernetHeader::SIZE];
-        let offset = header.write(&mut bytes).unwrap();
+        let offset = header.write(&mut bytes);
         assert_eq!(offset, EthernetHeader::SIZE);
 
         let ety = 0x01_02u16.to_be_bytes();
@@ -148,26 +148,6 @@ mod test {
             bytes,
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, ety[0], ety[1]]
         )
-    }
-
-    #[test]
-    fn write_eth_invalid() {
-        let header = EthernetHeader {
-            dst: [0, 1, 2, 3, 4, 5],
-            src: [6, 7, 8, 9, 10, 11],
-            ethertype: 0x01_02,
-        };
-
-        let mut bytes = [0u8; 10];
-        let result = header.write(&mut bytes);
-        assert_eq!(
-            result,
-            Err(HeaderWriteError::BufferLenghtForField {
-                field_name: "eth.src",
-                needed_length: 6,
-                remaining_length: 4
-            })
-        );
     }
 
     #[test]
@@ -179,7 +159,7 @@ mod test {
         };
 
         let mut bytes = [0u8; EthernetHeader::SIZE];
-        header.write(&mut bytes).unwrap();
+        header.write(&mut bytes);
 
         let parsed = EthernetHeader::from_bytes(&bytes).unwrap();
 
