@@ -19,15 +19,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stack = Stack::new(identity);
 
-    let sock = stack.udp_bind(7878)?;
+    let sock = stack.udp_bind(55674)?;
+
+    let mut req_ntp = [0u8; 48];
+    req_ntp[0] = 0x1b;
+
+    stack.udp_send(&sock, [162, 159, 200, 1], 123, req_ntp.to_vec());
 
     loop {
         stack.poll(&mut device)?;
 
         while let Some((addr, port, data)) = stack.udp_recv(&sock) {
-            let text = String::from_utf8_lossy(&data);
-            let reply = format!("reply: {}\n", text.trim());
-            stack.udp_send(&sock, addr, port, reply.into_bytes());
+            tracing::info!("udp recv {:?} {} {:?}", addr, port, data);
         }
 
         stack.wait(&mut device)?;

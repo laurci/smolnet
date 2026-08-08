@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use thiserror::Error;
 
@@ -11,6 +11,7 @@ use crate::{
         udp::{UdpEngine, UdpSocketBindError, UdpSocketHandle},
     },
     parser::{
+        arp::{ArpFrame, ArpOperation, ArpRequest},
         ethernet::{EthernetFrame, EthernetFrameParseEerror, EthernetPayload},
         ipv4::{Ipv4Frame, Ipv4Payload},
     },
@@ -32,11 +33,31 @@ pub enum StackFrameProcessError {
 pub struct StackIdentity {
     pub mac: MacAddr,
     pub ip: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+}
+
+impl StackIdentity {
+    pub fn next_hop(&self, dst: &Ipv4Addr) -> Ipv4Addr {
+        let netmask_value = u32::from_be_bytes(self.netmask);
+        let ip_value = u32::from_be_bytes(self.ip);
+        let dst_value = u32::from_be_bytes(*dst);
+
+        if dst_value & netmask_value == ip_value & netmask_value {
+            return *dst;
+        }
+
+        self.gateway
+    }
 }
 
 pub struct Stack {
     identity: StackIdentity,
     arp_cache: ArpCache,
+
+    pending_arp_ipv4: Vec<Ipv4Frame>,
+    inflight_arp_ipv4: HashSet<Ipv4Addr>,
+
     egress_queue: VecDeque<Vec<u8>>,
     udp_engine: UdpEngine,
 }
@@ -49,6 +70,10 @@ impl Stack {
         Stack {
             identity,
             arp_cache,
+
+            pending_arp_ipv4: vec![],
+            inflight_arp_ipv4: HashSet::new(),
+
             egress_queue: VecDeque::new(),
             udp_engine,
         }
@@ -74,17 +99,24 @@ impl Stack {
             }
         };
 
-        let udp_frames = self.udp_engine.drain_tx_queues();
-        for (dst_ip, frames) in udp_frames {
-            let Some(dst_mac) = self.arp_cache.lookup(&dst_ip).cloned() else {
+        self.inflight_arp_ipv4
+            .retain(|ip| self.arp_cache.lookup(ip).is_none());
+
+        for frame in self.pending_arp_ipv4.drain(..).collect::<Vec<_>>() {
+            let hop = self.identity.next_hop(frame.dst());
+            let Some(_) = self.arp_cache.lookup(&hop) else {
+                self.pending_arp_ipv4.push(frame);
                 continue;
             };
 
+            self.queue_egress_ipv4_frame(frame);
+        }
+
+        let udp_frames = self.udp_engine.drain_tx_queues();
+        for (dst_ip, frames) in udp_frames {
             for frame in frames {
                 let frame = Ipv4Frame::new(self.identity.ip, dst_ip, Ipv4Payload::UDP(frame));
-                let frame =
-                    EthernetFrame::new(self.identity.mac, dst_mac, EthernetPayload::Ipv4(frame));
-                self.queue_egress_eth_frame(frame);
+                self.queue_egress_ipv4_frame(frame);
             }
         }
 
@@ -148,6 +180,31 @@ impl Stack {
         self.queue_egress_frame(&write_buf[..size]);
     }
 
+    fn queue_egress_ipv4_frame(&mut self, frame: Ipv4Frame) {
+        let hop = self.identity.next_hop(frame.dst());
+
+        if let Some(dst_mac) = self.arp_cache.lookup(&hop).cloned() {
+            let frame =
+                EthernetFrame::new(self.identity.mac, dst_mac, EthernetPayload::Ipv4(frame));
+            self.queue_egress_eth_frame(frame);
+        } else {
+            if !self.inflight_arp_ipv4.contains(&hop) {
+                let arp_request = ArpRequest::new(self.identity.mac, self.identity.ip, hop);
+
+                let eth_frame = EthernetFrame::new(
+                    self.identity.mac,
+                    [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                    EthernetPayload::Arp(ArpFrame::new(ArpOperation::Request(arp_request))),
+                );
+
+                self.queue_egress_eth_frame(eth_frame);
+                self.inflight_arp_ipv4.insert(hop);
+            }
+
+            self.pending_arp_ipv4.push(frame);
+        };
+    }
+
     fn process_frame(&mut self, frame: &[u8]) -> Result<(), StackFrameProcessError> {
         let eth_frame = EthernetFrame::parse(frame)
             .map_err(|e| StackFrameProcessError::EthernetFrameParseEerror(e))?;
@@ -207,11 +264,15 @@ mod test {
     const ALICE_IDENTITY: StackIdentity = StackIdentity {
         mac: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
         ip: [10, 30, 0, 2],
+        netmask: [0xff, 0xff, 0xff, 0x00],
+        gateway: [10, 30, 0, 0],
     };
 
     const BOB_IDENTITY: StackIdentity = StackIdentity {
         mac: [0x19, 0x29, 0x39, 0x49, 0x59, 0x69],
         ip: [10, 30, 0, 3],
+        netmask: [0xff, 0xff, 0xff, 0x00],
+        gateway: [10, 30, 0, 0],
     };
 
     const BROADCAST_MAC: MacAddr = [0xff; 6];
@@ -264,5 +325,14 @@ mod test {
             alice_stack.arp_cache.lookup(&BOB_IDENTITY.ip),
             Some(&BOB_IDENTITY.mac)
         );
+    }
+
+    #[test]
+    fn next_hop() {
+        let same_net = ALICE_IDENTITY.next_hop(&[10, 30, 0, 5]);
+        assert_eq!(same_net, [10, 30, 0, 5]);
+
+        let external = ALICE_IDENTITY.next_hop(&[8, 8, 8, 8]);
+        assert_eq!(external, ALICE_IDENTITY.gateway);
     }
 }
