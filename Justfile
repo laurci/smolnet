@@ -1,5 +1,10 @@
+# UDP netcat examples
 # nc -u -l 10.30.0.5 7777
 # nc -u 10.30.0.2 7878
+
+# TCP netcat examples
+# nc -l 10.30.0.5 7777
+# nc 10.30.0.2 7878
 
 wan := "enp5s0"
 tap := "tap0"

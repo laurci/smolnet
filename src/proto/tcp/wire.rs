@@ -241,7 +241,7 @@ fn validate_options(bytes: &[u8]) -> Result<(), TcpFrameParseError> {
             TCP_OPTION_MSS => data_len == 2,
             TCP_OPTION_WND_SCALE => data_len == 1,
             TCP_OPTION_SACK_PERMITTED => data_len == 0,
-            TCP_OPTION_SACK_BLOCKS => data_len > 0 && data_len % SACK_BLOCK_SIZE == 0,
+            TCP_OPTION_SACK_BLOCKS => data_len > 0 && data_len.is_multiple_of(SACK_BLOCK_SIZE),
             TCP_OPTION_TIMESTAMPS => data_len == 8,
             _ => true,
         };

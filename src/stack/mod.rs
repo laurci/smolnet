@@ -10,7 +10,10 @@ use crate::{
     device::{Device, DeviceCapabilities, DeviceError, MAX_FRAME_SIZE, Medium},
     proto::{
         arp::engine::ArpEngine,
-        tcp::engine::TcpEngine,
+        tcp::{
+            TcpConnectError, TcpEngine, TcpListenError, TcpListenerHandle, TcpSocketHandle,
+            TcpState,
+        },
         udp::engine::{UdpDatagram, UdpEngine, UdpSocketBindError, UdpSocketHandle},
     },
     stack::tx::TxQueue,
@@ -229,6 +232,64 @@ impl Stack {
 
     pub fn udp_close(&mut self, handle: UdpSocketHandle) {
         self.udp.close(handle);
+    }
+
+    pub fn tcp_listen(&mut self, port: u16) -> Result<TcpListenerHandle, TcpListenError> {
+        self.tcp.listen(port)
+    }
+
+    pub fn tcp_accept(&mut self, listener: &TcpListenerHandle) -> Option<TcpSocketHandle> {
+        self.tcp.accept(listener)
+    }
+
+    pub fn tcp_close_listener(&mut self, listener: TcpListenerHandle) {
+        self.tcp.close_listener(listener);
+    }
+
+    pub fn tcp_connect(
+        &mut self,
+        remote_ip: Ipv4Addr,
+        remote_port: u16,
+        local_port: Option<u16>,
+    ) -> Result<TcpSocketHandle, TcpConnectError> {
+        let local_port = local_port.unwrap_or_else(|| self.alloc_ephemeral_port());
+
+        self.tcp.connect(
+            self.identity.ip,
+            local_port,
+            remote_ip,
+            remote_port,
+            Instant::now(),
+            &mut self.tx,
+        )
+    }
+
+    pub fn tcp_state(&self, handle: &TcpSocketHandle) -> Option<TcpState> {
+        self.tcp.state(handle)
+    }
+
+    pub fn tcp_can_recv(&self, handle: &TcpSocketHandle) -> bool {
+        self.tcp.can_recv(handle)
+    }
+
+    pub fn tcp_peer_finished(&self, handle: &TcpSocketHandle) -> bool {
+        self.tcp.peer_finished(handle)
+    }
+
+    pub fn tcp_recv(&mut self, handle: &TcpSocketHandle, buf: &mut [u8]) -> usize {
+        self.tcp.recv(handle, buf)
+    }
+
+    pub fn tcp_send_capacity(&self, handle: &TcpSocketHandle) -> usize {
+        self.tcp.send_capacity(handle)
+    }
+
+    pub fn tcp_send(&mut self, handle: &TcpSocketHandle, data: &[u8]) -> usize {
+        self.tcp.send(handle, data)
+    }
+
+    pub fn tcp_close(&mut self, handle: &TcpSocketHandle) {
+        self.tcp.close(handle);
     }
 }
 

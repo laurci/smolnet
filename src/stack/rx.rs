@@ -52,7 +52,7 @@ impl Stack {
                     }
                     EthernetPayload::Ipv4(ipv4_frame) => {
                         self.learn_from_link(&src_mac, ipv4_frame, now);
-                        self.process_ipv4(ipv4_frame);
+                        self.process_ipv4(ipv4_frame, now);
                     }
                     EthernetPayload::Unknown { ethertype, data } => {
                         tracing::debug!(
@@ -67,7 +67,7 @@ impl Stack {
                 let frame = Ipv4Frame::parse(bytes).map_err(StackRxError::Ipv4FrameParseError)?;
 
                 tracing::trace!(len = bytes.len(), "ipv4 datagram received");
-                self.process_ipv4(&frame);
+                self.process_ipv4(&frame, now);
             }
         }
 
@@ -88,7 +88,7 @@ impl Stack {
         arp.learn(src_ip, *src_mac, now, &mut self.tx);
     }
 
-    fn process_ipv4(&mut self, frame: &Ipv4Frame<'_>) {
+    fn process_ipv4(&mut self, frame: &Ipv4Frame<'_>, now: Instant) {
         if !self.identity.accepts_dst(frame.dst()) {
             tracing::trace!(
                 dst = ?frame.dst(),
@@ -111,7 +111,7 @@ impl Stack {
             Ipv4Payload::Udp(udp_frame) => self.udp.process(frame, udp_frame),
             Ipv4Payload::Tcp(tcp_frame) => {
                 self.tcp
-                    .process(frame, tcp_frame, self.identity.ip, &mut self.tx)
+                    .process(frame, tcp_frame, self.identity.ip, now, &mut self.tx)
             }
             Ipv4Payload::Unknown { protocol, data } => {
                 tracing::debug!(

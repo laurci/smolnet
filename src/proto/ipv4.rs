@@ -206,7 +206,7 @@ impl<'a> Ipv4Frame<'a> {
         }
 
         let header_len = header.header_len();
-        if header_len < IPV4_MIN_HEADER_SIZE || header_len > IPV4_MAX_HEADER_SIZE {
+        if !(IPV4_MIN_HEADER_SIZE..=IPV4_MAX_HEADER_SIZE).contains(&header_len) {
             return Err(Ipv4FrameParseError::InvalidHeaderLen(header_len));
         }
 

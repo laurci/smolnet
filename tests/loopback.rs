@@ -12,7 +12,10 @@ use smolnet::{
         eth::{ETHER_TYPE_IPV6, EthernetFrame, EthernetPayload},
         icmp::{IcmpFrame, IcmpMessage},
         ipv4::{Ipv4Frame, Ipv4Payload},
-        tcp::wire::{TCP_FLAG_SYN, TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr},
+        tcp::{
+            TcpState,
+            wire::{TCP_FLAG_SYN, TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr},
+        },
         udp::wire::UdpFrame,
     },
     stack::{Stack, StackIdentity},
@@ -75,6 +78,8 @@ fn to_alice(src_mac: MacAddr, dst_mac: MacAddr, payload: Ipv4Payload<'_>) -> Vec
     ))
 }
 
+type DropPolicy = Box<dyn FnMut(&[u8]) -> bool>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum From {
     Alice,
@@ -91,6 +96,9 @@ struct Net {
     now: Instant,
 
     seen: Vec<(From, Vec<u8>)>,
+
+    drop_policy: Option<DropPolicy>,
+    dropped: usize,
 }
 
 impl Net {
@@ -105,7 +113,13 @@ impl Net {
             bob_device,
             now: Instant::now(),
             seen: vec![],
+            drop_policy: None,
+            dropped: 0,
         }
+    }
+
+    fn drop_frames(&mut self, policy: impl FnMut(&[u8]) -> bool + 'static) {
+        self.drop_policy = Some(Box::new(policy));
     }
 
     fn ethernet() -> Net {
@@ -127,16 +141,50 @@ impl Net {
         let moved = !from_alice.is_empty() || !from_bob.is_empty();
 
         for frame in from_alice {
+            if self.should_drop(&frame) {
+                continue;
+            }
+
             self.bob_device.push_rx(&frame);
             self.seen.push((From::Alice, frame));
         }
 
         for frame in from_bob {
+            if self.should_drop(&frame) {
+                continue;
+            }
+
             self.alice_device.push_rx(&frame);
             self.seen.push((From::Bob, frame));
         }
 
         moved
+    }
+
+    fn should_drop(&mut self, frame: &[u8]) -> bool {
+        let Some(policy) = self.drop_policy.as_mut() else {
+            return false;
+        };
+
+        if policy(frame) {
+            self.dropped += 1;
+            return true;
+        }
+
+        false
+    }
+
+    fn run(&mut self, total: Duration, step: Duration) {
+        let mut elapsed = Duration::ZERO;
+
+        while elapsed <= total {
+            self.alice.poll(&mut self.alice_device, self.now).unwrap();
+            self.bob.poll(&mut self.bob_device, self.now).unwrap();
+            self.pump();
+
+            self.now += step;
+            elapsed += step;
+        }
     }
 
     fn settle(&mut self) {
@@ -522,9 +570,11 @@ fn malformed_input_is_rejected_without_panicking() {
 }
 
 #[test]
-fn tcp_syn_gets_a_checksum_valid_syn_ack() {
+fn tcp_syn_to_a_listening_port_gets_a_checksum_valid_syn_ack() {
     let now = Instant::now();
     let (mut alice, mut device) = stack(ALICE_IP, Medium::Ethernet { mac: ALICE_MAC });
+
+    alice.tcp_listen(7878).unwrap();
 
     let syn = TcpFrame::new(TcpRepr {
         src_port: 40000,
@@ -562,6 +612,162 @@ fn tcp_syn_gets_a_checksum_valid_syn_ack() {
     assert_eq!(tcp.dst_port(), 40000);
     assert_eq!(tcp.ack(), 1001);
     assert_eq!(tcp.mss(), Some(TCP_MSS_DEFAULT));
+}
+
+#[test]
+fn tcp_syn_to_a_dead_port_is_reset() {
+    let now = Instant::now();
+    let (mut alice, mut device) = stack(ALICE_IP, Medium::Ethernet { mac: ALICE_MAC });
+
+    let syn = TcpFrame::new(TcpRepr {
+        src_port: 40000,
+        dst_port: 9999,
+        seq: 1000,
+        flags: TCP_FLAG_SYN,
+        window: 64240,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let bytes = to_alice(BOB_MAC, ALICE_MAC, Ipv4Payload::Tcp(syn));
+
+    device.push_rx(&bytes);
+    alice.poll(&mut device, now).unwrap();
+
+    let sent = device.drain_tx();
+    assert_eq!(sent.len(), 1);
+
+    let reply = EthernetFrame::parse(&sent[0]).unwrap();
+    let EthernetPayload::Ipv4(ipv4) = reply.payload() else {
+        panic!("expected an ipv4 reply");
+    };
+    let Ipv4Payload::Tcp(tcp) = ipv4.payload() else {
+        panic!("expected a tcp reply");
+    };
+
+    assert!(tcp.rst());
+    assert_eq!(tcp.ack(), 1001);
+}
+
+#[test]
+fn tcp_connection_lifecycle_across_two_stacks() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+    assert!(net.alice.tcp_accept(&listener).is_none());
+
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::SynSent));
+
+    net.settle();
+
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::Established));
+
+    let server = net
+        .alice
+        .tcp_accept(&listener)
+        .expect("the handshake produced a connection to accept");
+    assert_eq!(net.alice.tcp_state(&server), Some(TcpState::Established));
+
+    assert_eq!(net.bob.tcp_send(&client, b"hello from bob"), 14);
+    net.settle();
+
+    let mut buf = [0u8; 64];
+    let n = net.alice.tcp_recv(&server, &mut buf);
+    assert_eq!(&buf[..n], b"hello from bob");
+
+    assert_eq!(net.alice.tcp_send(&server, b"and hello back"), 14);
+    net.settle();
+
+    let n = net.bob.tcp_recv(&client, &mut buf);
+    assert_eq!(&buf[..n], b"and hello back");
+
+    net.bob.tcp_close(&client);
+    net.settle();
+
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::FinWait2));
+    assert_eq!(net.alice.tcp_state(&server), Some(TcpState::CloseWait));
+    assert!(net.alice.tcp_peer_finished(&server));
+
+    net.alice.tcp_close(&server);
+    net.settle();
+
+    assert_eq!(
+        net.alice.tcp_state(&server),
+        None,
+        "the server saw its fin acknowledged and is gone"
+    );
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::TimeWait));
+
+    net.advance(Duration::from_secs(61));
+    net.settle();
+
+    assert_eq!(net.bob.tcp_state(&client), None, "time-wait expired");
+}
+
+#[test]
+fn tcp_carries_a_payload_larger_than_one_segment() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+    net.settle();
+
+    let server = net.alice.tcp_accept(&listener).unwrap();
+
+    let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(net.bob.tcp_send(&client, &payload), payload.len());
+
+    net.settle();
+
+    let mut received = vec![];
+    let mut buf = [0u8; 1500];
+    loop {
+        let n = net.alice.tcp_recv(&server, &mut buf);
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+    }
+
+    assert_eq!(received, payload, "the stream reassembled in order");
+}
+
+#[test]
+fn tcp_connect_to_a_dead_port_is_reset() {
+    let mut net = Net::ethernet();
+
+    let client = net.bob.tcp_connect(ALICE_IP, 9999, Some(40000)).unwrap();
+    net.settle();
+
+    assert_eq!(
+        net.bob.tcp_state(&client),
+        None,
+        "the reset tore the connection down"
+    );
+}
+
+#[test]
+fn tcp_server_closing_first_walks_the_other_path() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+    net.settle();
+
+    let server = net.alice.tcp_accept(&listener).unwrap();
+
+    net.alice.tcp_close(&server);
+    net.settle();
+
+    assert_eq!(net.alice.tcp_state(&server), Some(TcpState::FinWait2));
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::CloseWait));
+
+    net.bob.tcp_close(&client);
+    net.settle();
+
+    assert_eq!(net.bob.tcp_state(&client), None);
+    assert_eq!(net.alice.tcp_state(&server), Some(TcpState::TimeWait));
 }
 
 #[test]
@@ -727,5 +933,120 @@ fn ipv4_options_survive_the_link() {
     assert_eq!(
         alice.udp_recv(&sock),
         Some((BOB_IP, 5000, b"with options".to_vec()))
+    );
+}
+
+fn tcp_payload_len(frame: &[u8]) -> usize {
+    let Ok(eth) = EthernetFrame::parse(frame) else {
+        return 0;
+    };
+    let EthernetPayload::Ipv4(ipv4) = eth.payload() else {
+        return 0;
+    };
+    let Ipv4Payload::Tcp(tcp) = ipv4.payload() else {
+        return 0;
+    };
+
+    tcp.payload().len()
+}
+
+#[test]
+fn tcp_recovers_from_a_dropped_segment() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+    net.settle();
+
+    let server = net.alice.tcp_accept(&listener).unwrap();
+
+    let mut swallowed = false;
+    net.drop_frames(move |frame| {
+        if !swallowed && tcp_payload_len(frame) > 0 {
+            swallowed = true;
+            return true;
+        }
+
+        false
+    });
+
+    let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(net.bob.tcp_send(&client, &payload), payload.len());
+
+    net.run(Duration::from_secs(5), Duration::from_millis(100));
+
+    assert_eq!(net.dropped, 1, "exactly one segment was lost");
+
+    let mut received = vec![];
+    let mut buf = [0u8; 1500];
+    loop {
+        let n = net.alice.tcp_recv(&server, &mut buf);
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+    }
+
+    assert_eq!(
+        received, payload,
+        "the retransmission filled the hole and the stream arrived intact"
+    );
+}
+
+#[test]
+fn tcp_recovers_from_a_dropped_handshake() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+
+    let mut swallowed = false;
+    net.drop_frames(move |frame| {
+        let Ok(eth) = EthernetFrame::parse(frame) else {
+            return false;
+        };
+        let EthernetPayload::Ipv4(ipv4) = eth.payload() else {
+            return false;
+        };
+        let Ipv4Payload::Tcp(tcp) = ipv4.payload() else {
+            return false;
+        };
+
+        if !swallowed && tcp.syn() && !tcp.ack_flag() {
+            swallowed = true;
+            return true;
+        }
+
+        false
+    });
+
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+
+    net.run(Duration::from_secs(3), Duration::from_millis(100));
+
+    assert_eq!(net.dropped, 1, "the first syn was lost");
+    assert_eq!(net.bob.tcp_state(&client), Some(TcpState::Established));
+    assert!(net.alice.tcp_accept(&listener).is_some());
+}
+
+#[test]
+fn tcp_gives_up_when_the_peer_disappears() {
+    let mut net = Net::ethernet();
+
+    let listener = net.alice.tcp_listen(7878).unwrap();
+    let client = net.bob.tcp_connect(ALICE_IP, 7878, Some(40000)).unwrap();
+    net.settle();
+
+    let _server = net.alice.tcp_accept(&listener).unwrap();
+
+    net.drop_frames(|frame| tcp_payload_len(frame) > 0);
+
+    net.bob.tcp_send(&client, b"nobody will ever see this");
+    net.run(Duration::from_secs(180), Duration::from_secs(1));
+
+    assert!(net.dropped > 0);
+    assert_eq!(
+        net.bob.tcp_state(&client),
+        None,
+        "the sender gave up and tore the connection down"
     );
 }

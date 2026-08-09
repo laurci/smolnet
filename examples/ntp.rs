@@ -10,7 +10,8 @@ use tracing_subscriber::EnvFilter;
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("smolnet=info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("ntp=info,smolnet=info")),
         )
         .init();
 }
