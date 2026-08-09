@@ -81,8 +81,8 @@ async fn a_node_is_assigned_an_address_from_the_control_server() {
     let first = join(&control, network).await;
     let second = join(&control, network).await;
 
-    assert_eq!(first.ipv4_addr(), Ipv4Addr::new(10, 30, 0, 2));
-    assert_eq!(second.ipv4_addr(), Ipv4Addr::new(10, 30, 0, 3));
+    assert_eq!(first.ipv4_addr(), Ipv4Addr::new(10, 77, 0, 2));
+    assert_eq!(second.ipv4_addr(), Ipv4Addr::new(10, 77, 0, 3));
 
     assert_eq!(
         second.membership().peers.len(),

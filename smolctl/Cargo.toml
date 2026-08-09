@@ -25,3 +25,7 @@ tonic-prost-build = "0.14"
 [[bin]]
 name = "smolctl"
 path = "src/bin/smolctl.rs"
+
+[[bin]]
+name = "smolnode"
+path = "src/bin/smolnode.rs"

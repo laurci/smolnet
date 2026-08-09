@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -50,13 +51,55 @@ impl Wire {
     }
 }
 
+pub struct WritableGate {
+    open: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl Default for WritableGate {
+    fn default() -> WritableGate {
+        WritableGate {
+            open: AtomicBool::new(true),
+            waker: Mutex::new(None),
+        }
+    }
+}
+
+impl WritableGate {
+    pub fn set(&self, open: bool) {
+        self.open.store(open, Ordering::SeqCst);
+
+        if open && let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    fn poll_open(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.is_open() {
+            return Poll::Ready(());
+        }
+
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+
+        if self.is_open() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 pub struct LoopbackDevice {
     rx: Arc<Wire>,
     tx: Arc<Wire>,
 
     capabilities: DeviceCapabilities,
 
-    writable: bool,
+    writable: Arc<WritableGate>,
 }
 
 impl LoopbackDevice {
@@ -65,7 +108,7 @@ impl LoopbackDevice {
             rx: Arc::new(Wire::default()),
             tx: Arc::new(Wire::default()),
             capabilities: DeviceCapabilities::new(medium),
-            writable: true,
+            writable: Arc::new(WritableGate::default()),
         }
     }
 
@@ -78,13 +121,13 @@ impl LoopbackDevice {
                 rx: one.clone(),
                 tx: two.clone(),
                 capabilities: DeviceCapabilities::new(left),
-                writable: true,
+                writable: Arc::new(WritableGate::default()),
             },
             LoopbackDevice {
                 rx: two,
                 tx: one,
                 capabilities: DeviceCapabilities::new(right),
-                writable: true,
+                writable: Arc::new(WritableGate::default()),
             },
         )
     }
@@ -126,8 +169,12 @@ impl LoopbackDevice {
         self.rx.len()
     }
 
-    pub fn set_writable(&mut self, writable: bool) {
-        self.writable = writable;
+    pub fn set_writable(&self, writable: bool) {
+        self.writable.set(writable);
+    }
+
+    pub fn writable_gate(&self) -> Arc<WritableGate> {
+        self.writable.clone()
     }
 }
 
@@ -154,7 +201,7 @@ impl Device for LoopbackDevice {
     }
 
     fn write_frame(&mut self, data: &[u8]) -> Result<(), DeviceError> {
-        if !self.writable {
+        if !self.writable.is_open() {
             tracing::trace!("loopback device is not writable");
             return Err(DeviceError::WouldBlock);
         }
@@ -169,7 +216,7 @@ impl Device for LoopbackDevice {
         self.rx.poll_ready(cx).map(Ok)
     }
 
-    fn poll_writable(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.writable.poll_open(cx).map(Ok)
     }
 }

@@ -5,6 +5,9 @@ pub mod tap;
 #[cfg(all(target_os = "linux", feature = "tuntap"))]
 pub mod tun;
 
+#[cfg(all(target_os = "macos", feature = "tuntap"))]
+pub mod utun;
+
 #[cfg(all(target_os = "linux", feature = "tuntap"))]
 mod tuntap;
 

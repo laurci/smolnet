@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::proto::{PeerGone, PeerState, ServerMessage, server_message};
 
-pub const DEFAULT_SUBNET: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 0);
+pub const DEFAULT_SUBNET: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 0);
 
 pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
@@ -241,8 +241,8 @@ mod test {
         let first = registry.join(network, NodeId::random(), 8).unwrap();
         let second = registry.join(network, NodeId::random(), 8).unwrap();
 
-        assert_eq!(first.ip, Ipv4Addr::new(10, 30, 0, 2));
-        assert_eq!(second.ip, Ipv4Addr::new(10, 30, 0, 3));
+        assert_eq!(first.ip, Ipv4Addr::new(10, 77, 0, 2));
+        assert_eq!(second.ip, Ipv4Addr::new(10, 77, 0, 3));
         assert_eq!(first.netmask, DEFAULT_NETMASK);
     }
 
@@ -293,7 +293,7 @@ mod test {
 
         assert_eq!(bob.peers.len(), 1);
         assert_eq!(bob.peers[0].node, alice.to_string());
-        assert_eq!(bob.peers[0].ip, "10.30.0.2");
+        assert_eq!(bob.peers[0].ip, "10.77.0.2");
     }
 
     #[tokio::test]
