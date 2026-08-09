@@ -264,6 +264,10 @@ impl Stack {
     ) {
         self.udp_engine.send(handle, dst_addr, dst_port, payload);
     }
+
+    pub fn udp_close(&mut self, handle: UdpSocketHandle) {
+        self.udp_engine.close(handle);
+    }
 }
 
 #[cfg(test)]

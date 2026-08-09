@@ -8,7 +8,6 @@ use crate::{
     stack::StackIdentity,
 };
 
-#[derive(Clone, Copy)]
 pub struct UdpSocketHandle(usize);
 
 struct UdpSocket {
@@ -124,6 +123,19 @@ impl UdpEngine {
         };
 
         socket.tx_queue.push_back((dst_addr, dst_port, payload));
+    }
+
+    pub fn close(&mut self, handle: UdpSocketHandle) {
+        let Some(port) = self.handle_ports.get(&handle.0) else {
+            tracing::warn!(
+                "couldn't find socket for handle {} while attempting write",
+                handle.0
+            );
+            return;
+        };
+
+        self.sockets.remove(port);
+        self.handle_ports.remove(&handle.0);
     }
 }
 
