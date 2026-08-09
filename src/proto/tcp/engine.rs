@@ -682,6 +682,45 @@ mod test {
     }
 
     #[test]
+    fn fast_retransmit_fills_the_hole_without_resending_the_window() {
+        let mut harness = Harness::established();
+        let handle = harness.handle();
+
+        harness.engine.send(&handle, &[0x41; TCP_SEND_BUFFER]);
+
+        let first = harness.tick(Duration::ZERO);
+        let first_bytes: usize = first.iter().map(|s| s.payload().len()).sum();
+
+        assert!(first.len() > 2, "the window held several segments");
+
+        let hole = first[0].seq();
+        let peer_seq = harness.peer_seq;
+
+        for _ in 0..3 {
+            let (ipv4, tcp) = inbound(peer_seq, hole, TCP_FLAG_ACK, &[]);
+            harness
+                .engine
+                .process(&ipv4, &tcp, LOCAL_IP, harness.now, &mut harness.tx);
+        }
+
+        drain(&mut harness.tx);
+
+        let recovery = harness.tick(Duration::from_millis(1));
+        let recovered_bytes: usize = recovery.iter().map(|s| s.payload().len()).sum();
+
+        assert!(!recovery.is_empty(), "recovery sends something");
+        assert_eq!(
+            recovery[0].seq(),
+            hole,
+            "the first thing out is the missing segment"
+        );
+        assert!(
+            recovered_bytes < first_bytes,
+            "we fill the hole rather than replaying the window: {recovered_bytes} vs {first_bytes}"
+        );
+    }
+
+    #[test]
     fn slow_start_grows_the_window_as_acks_arrive() {
         let mut harness = Harness::established();
         let handle = harness.handle();

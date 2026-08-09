@@ -185,6 +185,8 @@ pub(super) struct TcpConnection {
     recv_scale: u8,
     sack_permitted: bool,
     sacked: Vec<(u32, u32)>,
+    recovery: Option<u32>,
+    rescue: Option<u32>,
     fin_seq: Option<u32>,
 
     rcv_nxt: u32,
@@ -233,6 +235,8 @@ impl TcpConnection {
             recv_scale: 0,
             sack_permitted: false,
             sacked: vec![],
+            recovery: None,
+            rescue: None,
             fin_seq: None,
             rcv_nxt: 0,
             peer_fin_seq: None,
@@ -615,6 +619,13 @@ impl TcpConnection {
         self.snd_una = ack;
         self.sacked.retain(|(_, end)| seq::gt(*end, ack));
 
+        if let Some(point) = self.recovery
+            && seq::geq(ack, point)
+        {
+            self.recovery = None;
+            self.rescue = None;
+        }
+
         self.round_trip.take_sample(ack, now);
         self.congestion
             .on_new_ack(data_acked, self.snd_mss as usize);
@@ -652,9 +663,56 @@ impl TcpConnection {
             "tcp fast retransmit"
         );
 
-        self.snd_nxt = self.snd_una;
+        self.recovery = Some(self.snd_nxt);
+        self.rescue = Some(self.snd_una);
         self.round_trip.discard_sample();
         self.arm_retransmit(now);
+    }
+
+    fn send_rescue(&mut self, now: Instant, tx: &mut TxQueue) -> bool {
+        let Some(at) = self.rescue.take() else {
+            return false;
+        };
+
+        if !seq::geq(at, self.snd_una) || !seq::lt(at, self.snd_nxt) {
+            return false;
+        }
+
+        let offset = at.wrapping_sub(self.snd_una) as usize;
+
+        if offset >= self.send_buffer.len() {
+            return false;
+        }
+
+        let len = (self.send_buffer.len() - offset).min(self.snd_mss as usize);
+        let payload: Vec<u8> = self
+            .send_buffer
+            .range(offset..offset + len)
+            .copied()
+            .collect();
+
+        tracing::debug!(
+            local_port = self.key.local_port,
+            at,
+            len,
+            "tcp retransmitting the hole without rewinding"
+        );
+
+        emit(
+            self.local_ip,
+            &self.key,
+            at,
+            self.rcv_nxt,
+            TCP_FLAG_PSH | TCP_FLAG_ACK,
+            self.advertised_window(),
+            &[],
+            payload,
+            tx,
+        );
+
+        self.arm_retransmit(now);
+
+        true
     }
 
     fn on_synchronized(&mut self, tcp: &TcpFrame<'_>, now: Instant) -> SegmentOutcome {
@@ -914,6 +972,7 @@ impl TcpConnection {
         let mut sent = false;
 
         if self.state.sends_stream() {
+            sent |= self.send_rescue(now, tx);
             sent |= self.send_pending_data(now, tx);
             sent |= self.send_pending_fin(tx);
         }
