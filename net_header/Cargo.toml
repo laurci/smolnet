@@ -6,5 +6,5 @@ edition = "2024"
 
 [dependencies]
 meta = { path = "./meta" }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = "0.1.44"

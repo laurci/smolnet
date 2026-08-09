@@ -10,7 +10,7 @@ members = ["net_header", "net_header/meta", "."]
 net_header = { path = "./net_header" }
 nix = { version = "0.31.3", features = ["ioctl", "poll", "fs"] }
 rand = "0.10.2"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tracing = "0.1.44"
 
 [dev-dependencies]
