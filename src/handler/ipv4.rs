@@ -3,7 +3,10 @@ use crate::{
         icmp,
         udp::{self, UdpEngine},
     },
-    parser::ipv4::{Ipv4Frame, Ipv4Payload},
+    parser::{
+        ipv4::{Ipv4Frame, Ipv4Payload},
+        tcp::TcpSegment,
+    },
     stack::StackIdentity,
 };
 
@@ -27,6 +30,21 @@ pub fn process_frame(
 
         Ipv4Payload::UDP(udp) => {
             udp::process_frame(identity, udp_engine, &ipv4_frame, &udp);
+        }
+
+        Ipv4Payload::TCP(tcp) => {
+            tracing::info!("tcp frame passed checksum {:?}", tcp);
+
+            let frame = tcp.reply(
+                5000,
+                TcpSegment::SynAck {
+                    iss: 10245,
+                    ack: tcp.seq() + 1,
+                },
+            );
+            let frame = ipv4_frame.reply(identity, Ipv4Payload::TCP(frame));
+
+            reply_queue.push(frame);
         }
     }
 
