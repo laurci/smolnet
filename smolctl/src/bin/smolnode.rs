@@ -91,10 +91,12 @@ fn configure(
         "ifconfig",
         &[interface, &ip, &ip, "netmask", &netmask, "mtu", &mtu, "up"],
     )?;
-    run(
+    if let Err(e) = run(
         "route",
         &["-n", "add", "-net", &subnet, "-interface", interface],
-    )?;
+    ) {
+        tracing::warn!("could not add the subnet route, it may already exist: {e}");
+    }
 
     Ok(())
 }
