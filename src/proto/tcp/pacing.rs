@@ -2,7 +2,9 @@ use std::time::{Duration, Instant};
 
 pub const TCP_PACING_GAIN_NUM: u64 = 5;
 pub const TCP_PACING_GAIN_DEN: u64 = 4;
-pub const TCP_PACING_BURST_SEGMENTS: usize = 4;
+pub const TCP_PACING_BURST_SEGMENTS: usize = 16;
+
+pub const TCP_PACING_BURST_MICROS: u64 = 4_000;
 
 #[derive(Debug, Default)]
 pub struct Pacer {
@@ -23,9 +25,9 @@ impl Pacer {
     }
 
     fn burst(rate: u64, mss: usize) -> usize {
-        let per_millisecond = (rate / 1_000) as usize;
+        let window = (u128::from(rate) * u128::from(TCP_PACING_BURST_MICROS) / 1_000_000) as usize;
 
-        per_millisecond.max(mss.saturating_mul(TCP_PACING_BURST_SEGMENTS))
+        window.max(mss.saturating_mul(TCP_PACING_BURST_SEGMENTS))
     }
 
     pub fn allowance(
@@ -131,8 +133,8 @@ mod test {
 
         assert_eq!(
             after_a_second,
-            (rate / 1_000) as usize,
-            "credit never accumulates beyond a millisecond of sending"
+            (rate * 4 / 1_000) as usize,
+            "credit never accumulates beyond a few milliseconds of sending"
         );
     }
 
@@ -150,12 +152,12 @@ mod test {
     }
 
     #[test]
-    fn a_burst_is_a_millisecond_of_sending_with_a_floor() {
+    fn a_burst_is_a_few_milliseconds_of_sending_with_a_floor() {
         let slow = Pacer::burst(1_000, MSS);
         let fast = Pacer::burst(100_000_000, MSS);
 
-        assert_eq!(slow, MSS * 4, "a slow link still gets a few segments");
-        assert_eq!(fast, 100_000, "a fast link gets a millisecond of data");
+        assert_eq!(slow, MSS * 16, "a slow link still gets a useful burst");
+        assert_eq!(fast, 400_000, "a fast link gets a few milliseconds of data");
     }
 
     #[test]
