@@ -7,7 +7,7 @@ pub mod proto {
 }
 
 pub use crate::{
-    client::{JoinConfig, JoinError, Session},
+    client::{Control, JoinConfig, JoinError, Joined, Session},
     server::{ControlService, registry::Registry},
     token::{Identity, TokenError},
 };

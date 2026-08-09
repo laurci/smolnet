@@ -12,8 +12,11 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
-    pub fn open(interface_name: &str) -> Result<TunDevice, TunTapOpenError> {
-        let capabilities = DeviceCapabilities::new(Medium::Ip);
+    pub fn open(interface_name: &str, mtu: usize) -> Result<TunDevice, TunTapOpenError> {
+        let capabilities = DeviceCapabilities {
+            medium: Medium::Ip,
+            mtu,
+        };
         let inner = TunTapDevice::open(interface_name, IFF_TUN | IFF_NO_PI, capabilities)?;
 
         tracing::info!(

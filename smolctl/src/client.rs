@@ -7,6 +7,7 @@ use smolnet::net::{Driver, Net};
 use thiserror::Error;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Endpoint;
@@ -83,12 +84,9 @@ pub enum JoinError {
     Token,
 }
 
-pub struct Session {
-    net: Net,
-    driver: Driver<MeshDevice>,
+pub struct Control {
     handle: MeshHandle,
     peers: Peers,
-    membership: Membership,
     reflector: SocketAddr,
     inbound: Streaming<ServerMessage>,
     outbound: mpsc::Sender<ClientMessage>,
@@ -96,8 +94,96 @@ pub struct Session {
     stun: Vec<String>,
 }
 
-impl Session {
-    pub async fn join(config: JoinConfig) -> Result<Session, JoinError> {
+impl Control {
+    pub async fn run(self) -> Result<(), std::io::Error> {
+        let Control {
+            handle,
+            peers,
+            reflector,
+            mut inbound,
+            outbound,
+            mut candidates,
+            stun,
+        } = self;
+
+        let local = local_candidate(reflector, handle.local_addr()?).await;
+        let mut observed = handle.observe();
+
+        let mut probe = tokio::time::interval(PROBE_INTERVAL);
+        let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+
+        loop {
+            tokio::select! {
+                _ = probe.tick() => {
+                    if let Err(e) = handle.probe(reflector).await {
+                        tracing::warn!("could not probe the reflector: {e}");
+                    }
+
+                    discover(&handle, &stun).await;
+                }
+                _ = keepalive.tick() => punch(&handle, &candidates).await,
+                changed = observed.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+
+                    publish(&outbound, handle.observed(), local).await;
+                }
+                message = inbound.next() => {
+                    match message {
+                        Some(Ok(message)) => {
+                            if apply(&peers, &mut candidates, message) {
+                                punch(&handle, &candidates).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("control stream failed: {e}");
+                            break;
+                        }
+                        None => {
+                            tracing::info!("the control server closed the session");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct Joined {
+    pub membership: Membership,
+    pub device: MeshDevice,
+    pub handle: MeshHandle,
+    pub peers: Peers,
+    pub control: Control,
+}
+
+impl Joined {
+    pub fn into_session(self) -> Session {
+        let Joined {
+            membership,
+            device,
+            handle,
+            peers,
+            control,
+        } = self;
+
+        let (net, driver) = smolnet::net::build(membership.stack_identity(), device);
+
+        Session {
+            net,
+            driver,
+            handle,
+            peers,
+            membership,
+            control,
+        }
+    }
+
+    pub async fn join(config: JoinConfig) -> Result<Joined, JoinError> {
         let endpoint = Endpoint::from_shared(config.control.clone())
             .map_err(|_| JoinError::Endpoint(config.control.clone()))?;
 
@@ -180,20 +266,37 @@ impl Session {
             .map_err(JoinError::Socket)?;
 
         let peers = handle.peers();
-        let (net, driver) = smolnet::net::build(membership.stack_identity(), device);
 
-        Ok(Session {
-            net,
-            driver,
-            handle,
-            peers,
+        Ok(Joined {
             membership,
-            reflector,
-            inbound,
-            outbound,
-            candidates,
-            stun: config.stun,
+            device,
+            handle: handle.clone(),
+            peers: peers.clone(),
+            control: Control {
+                handle,
+                peers,
+                reflector,
+                inbound,
+                outbound,
+                candidates,
+                stun: config.stun,
+            },
         })
+    }
+}
+
+pub struct Session {
+    net: Net,
+    driver: Driver<MeshDevice>,
+    handle: MeshHandle,
+    peers: Peers,
+    membership: Membership,
+    control: Control,
+}
+
+impl Session {
+    pub async fn join(config: JoinConfig) -> Result<Session, JoinError> {
+        Joined::join(config).await.map(Joined::into_session)
     }
 
     pub fn net(&self) -> Net {
@@ -218,68 +321,17 @@ impl Session {
 
     pub async fn run(self) -> Result<(), std::io::Error> {
         let Session {
-            driver,
-            handle,
-            peers,
-            reflector,
-            mut inbound,
-            outbound,
-            mut candidates,
-            stun,
-            ..
+            driver, control, ..
         } = self;
 
-        let mut stack = tokio::spawn(driver.run());
+        let mut running = JoinSet::new();
+        running.spawn(driver.run());
+        running.spawn(control.run());
 
-        let local = local_candidate(reflector, handle.local_addr()?).await;
-        let mut observed = handle.observe();
-
-        let mut probe = tokio::time::interval(PROBE_INTERVAL);
-        let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
-
-        loop {
-            tokio::select! {
-                _ = probe.tick() => {
-                    if let Err(e) = handle.probe(reflector).await {
-                        tracing::warn!("could not probe the reflector: {e}");
-                    }
-
-                    discover(&handle, &stun).await;
-                }
-                _ = keepalive.tick() => punch(&handle, &candidates).await,
-                changed = observed.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-
-                    publish(&outbound, handle.observed(), local).await;
-                }
-                message = inbound.next() => {
-                    match message {
-                        Some(Ok(message)) => {
-                            if apply(&peers, &mut candidates, message) {
-                                punch(&handle, &candidates).await;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!("control stream failed: {e}");
-                            break;
-                        }
-                        None => {
-                            tracing::info!("the control server closed the session");
-                            break;
-                        }
-                    }
-                }
-                result = &mut stack => {
-                    return result.unwrap_or_else(|e| Err(std::io::Error::other(e)));
-                }
-            }
+        match running.join_next().await {
+            Some(result) => result.unwrap_or_else(|e| Err(std::io::Error::other(e))),
+            None => Ok(()),
         }
-
-        stack.abort();
-
-        Ok(())
     }
 }
 
