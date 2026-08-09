@@ -1,18 +1,30 @@
+#[cfg(target_os = "linux")]
 use std::error::Error;
+#[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use smolnet::{device::tap::TapDevice, stack::StackIdentity};
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(target_os = "linux")]
 use tokio::task::spawn;
+#[cfg(target_os = "linux")]
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
 const SERVER: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 5);
+#[cfg(target_os = "linux")]
 const SERVER_PORT: u16 = 7777;
+#[cfg(target_os = "linux")]
 const MESSAGE: &str = "hello from smolnet";
 
+#[cfg(target_os = "linux")]
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(target_os = "linux")]
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -22,6 +34,7 @@ fn init_tracing() {
         .init();
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
@@ -53,4 +66,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", line.trim_end());
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("tcp_client needs a tun/tap device, which only exists on linux");
 }

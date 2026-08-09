@@ -1,7 +1,11 @@
 pub mod loopback;
+
+#[cfg(all(target_os = "linux", feature = "tuntap"))]
 pub mod tap;
+#[cfg(all(target_os = "linux", feature = "tuntap"))]
 pub mod tun;
 
+#[cfg(all(target_os = "linux", feature = "tuntap"))]
 mod tuntap;
 
 use std::io;

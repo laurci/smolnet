@@ -1,20 +1,30 @@
+#[cfg(target_os = "linux")]
 use std::error::Error;
+#[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_os = "linux")]
 use axum::{
     Router,
     extract::{ConnectInfo, State},
     response::IntoResponse,
     routing::get,
 };
+#[cfg(target_os = "linux")]
 use smolnet::{axum::PeerAddr, device::tap::TapDevice, stack::StackIdentity};
+#[cfg(target_os = "linux")]
 use tokio::task::spawn;
+#[cfg(target_os = "linux")]
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
 const LISTEN_PORT: u16 = 8080;
 
+#[cfg(target_os = "linux")]
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -24,6 +34,7 @@ fn init_tracing() {
         .init();
 }
 
+#[cfg(target_os = "linux")]
 async fn index(
     State(visits): State<Arc<AtomicUsize>>,
     ConnectInfo(peer): ConnectInfo<PeerAddr>,
@@ -35,6 +46,7 @@ async fn index(
     format!("Hello, world! You are visitor {visit} from {peer}.\n")
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
@@ -66,4 +78,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("axum_hello needs a tun/tap device, which only exists on linux");
 }
