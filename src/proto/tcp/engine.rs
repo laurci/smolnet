@@ -703,7 +703,7 @@ mod test {
 
         harness.engine.send(&handle, &[0x41; TCP_SEND_BUFFER]);
 
-        let second = harness.tick(Duration::ZERO);
+        let second = harness.tick(Duration::from_millis(1));
         let second_bytes: usize = second.iter().map(|s| s.payload().len()).sum();
 
         assert!(

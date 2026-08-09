@@ -1,0 +1,22 @@
+[package]
+name = "smolrun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+smolctl = { path = "../smolctl" }
+smolmesh = { path = "../smolmesh" }
+smolnet = { path = ".." }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+axum = "0.8"
+
+[[bin]]
+name = "smolrun"
+path = "src/main.rs"

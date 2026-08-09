@@ -21,11 +21,33 @@ use crate::{
 
 pub const MESH_MTU: usize = 1280;
 
+pub const MESH_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
 pub const MAX_DATAGRAM_SIZE: usize = HEADER_SIZE + MESH_MTU;
 
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV4_SOURCE_OFFSET: usize = 12;
 const IPV4_DESTINATION_OFFSET: usize = 16;
+
+fn enlarge(socket: &UdpSocket, option: libc::c_int, bytes: usize) {
+    use std::os::fd::AsRawFd;
+
+    let size = bytes as libc::c_int;
+
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            &size as *const libc::c_int as *const libc::c_void,
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+
+    if result != 0 {
+        tracing::debug!(option, bytes, "could not enlarge the mesh socket buffer");
+    }
+}
 
 fn ipv4_address_at(packet: &[u8], offset: usize) -> Option<Ipv4Addr> {
     if packet.len() < IPV4_HEADER_SIZE || packet[0] >> 4 != 4 {
@@ -120,6 +142,10 @@ impl MeshDevice {
         membership: &Membership,
     ) -> io::Result<(MeshDevice, MeshHandle)> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
+
+        for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            enlarge(&socket, option, MESH_SOCKET_BUFFER);
+        }
         let peers = membership.peers.iter().cloned().collect::<Peers>();
         let observed = Arc::new(watch::Sender::new(Observed::default()));
         let transaction = stun::transaction();

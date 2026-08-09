@@ -14,7 +14,7 @@ use smolnet::{
         ipv4::{Ipv4Frame, Ipv4Payload},
         tcp::{
             TcpState,
-            wire::{TCP_FLAG_SYN, TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr},
+            wire::{TCP_FLAG_ACK, TCP_FLAG_SYN, TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr},
         },
         udp::wire::UdpFrame,
     },
@@ -1048,5 +1048,136 @@ fn tcp_gives_up_when_the_peer_disappears() {
         net.bob.tcp_state(&client),
         None,
         "the sender gave up and tore the connection down"
+    );
+}
+
+#[test]
+fn tcp_offers_window_scaling_and_sack_on_a_syn_ack() {
+    let now = Instant::now();
+    let (mut alice, mut device) = stack(ALICE_IP, Medium::Ethernet { mac: ALICE_MAC });
+
+    alice.tcp_listen(7878).unwrap();
+
+    let syn = TcpFrame::new(TcpRepr {
+        src_port: 40000,
+        dst_port: 7878,
+        seq: 1000,
+        flags: TCP_FLAG_SYN,
+        window: 64240,
+        options: &[
+            TcpOption::Mss(TCP_MSS_DEFAULT),
+            TcpOption::WindowScale(7),
+            TcpOption::SackPermitted,
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    device.push_rx(&to_alice(BOB_MAC, ALICE_MAC, Ipv4Payload::Tcp(syn)));
+    alice.poll(&mut device, now).unwrap();
+
+    let sent = device.drain_tx();
+    let ethernet = EthernetFrame::parse(&sent[0]).unwrap();
+    let EthernetPayload::Ipv4(ipv4) = ethernet.payload() else {
+        panic!("expected ipv4");
+    };
+    let Ipv4Payload::Tcp(reply) = ipv4.payload() else {
+        panic!("expected tcp");
+    };
+
+    assert!(reply.syn() && reply.ack_flag());
+    assert!(
+        reply.window_scale().is_some(),
+        "we mirror the peer's window scale offer"
+    );
+    assert!(reply.sack_permitted(), "we mirror the peer's sack offer");
+    assert_eq!(
+        reply.window(),
+        u16::MAX,
+        "a syn advertises the unscaled window, clamped to the 16 bit field"
+    );
+}
+
+#[test]
+fn tcp_stays_unscaled_when_the_peer_does_not_offer_it() {
+    let now = Instant::now();
+    let (mut alice, mut device) = stack(ALICE_IP, Medium::Ethernet { mac: ALICE_MAC });
+
+    alice.tcp_listen(7878).unwrap();
+
+    let syn = TcpFrame::new(TcpRepr {
+        src_port: 40001,
+        dst_port: 7878,
+        seq: 1000,
+        flags: TCP_FLAG_SYN,
+        window: 64240,
+        options: &[TcpOption::Mss(TCP_MSS_DEFAULT)],
+        ..Default::default()
+    })
+    .unwrap();
+
+    device.push_rx(&to_alice(BOB_MAC, ALICE_MAC, Ipv4Payload::Tcp(syn)));
+    alice.poll(&mut device, now).unwrap();
+
+    let sent = device.drain_tx();
+    let ethernet = EthernetFrame::parse(&sent[0]).unwrap();
+    let EthernetPayload::Ipv4(ipv4) = ethernet.payload() else {
+        panic!("expected ipv4");
+    };
+    let Ipv4Payload::Tcp(reply) = ipv4.payload() else {
+        panic!("expected tcp");
+    };
+
+    assert!(
+        reply.window_scale().is_none(),
+        "scaling is only enabled when both sides ask for it"
+    );
+    assert!(!reply.sack_permitted());
+}
+
+#[test]
+fn tcp_never_scales_the_window_carried_by_a_syn() {
+    let now = Instant::now();
+    let (mut alice, mut device) = stack(ALICE_IP, Medium::Ethernet { mac: ALICE_MAC });
+
+    alice.tcp_listen(7878).unwrap();
+
+    let syn = TcpFrame::new(TcpRepr {
+        src_port: 40002,
+        dst_port: 7878,
+        seq: 1000,
+        flags: TCP_FLAG_SYN,
+        window: 100,
+        options: &[
+            TcpOption::Mss(TCP_MSS_DEFAULT),
+            TcpOption::WindowScale(7),
+            TcpOption::SackPermitted,
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    device.push_rx(&to_alice(BOB_MAC, ALICE_MAC, Ipv4Payload::Tcp(syn)));
+    alice.poll(&mut device, now).unwrap();
+
+    device.drain_tx();
+
+    let ack = TcpFrame::new(TcpRepr {
+        src_port: 40002,
+        dst_port: 7878,
+        seq: 1001,
+        ack: 1,
+        flags: TCP_FLAG_ACK,
+        window: 100,
+        ..Default::default()
+    })
+    .unwrap();
+
+    device.push_rx(&to_alice(BOB_MAC, ALICE_MAC, Ipv4Payload::Tcp(ack)));
+    alice.poll(&mut device, now).unwrap();
+
+    assert!(
+        device.drain_tx().is_empty(),
+        "a 100 byte peer window must not be read as 12800 and flooded"
     );
 }

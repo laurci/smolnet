@@ -1,6 +1,7 @@
 pub mod congestion;
 pub mod connection;
 pub mod engine;
+pub mod pacing;
 pub mod rtt;
 pub mod seq;
 pub mod wire;

@@ -1626,6 +1626,7 @@ dependencies = [
 name = "smolmesh"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rand 0.10.2",
  "smolnet",
  "thiserror",
@@ -1642,6 +1643,22 @@ dependencies = [
  "net_header",
  "nix",
  "rand 0.10.2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "smolrun"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "libc",
+ "smolctl",
+ "smolmesh",
+ "smolnet",
  "thiserror",
  "tokio",
  "tracing",

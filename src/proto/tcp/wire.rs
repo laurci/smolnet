@@ -475,6 +475,13 @@ impl<'a> TcpFrame<'a> {
         })
     }
 
+    pub fn sack_blocks(&self) -> Option<SackBlocks<'_>> {
+        self.options().find_map(|option| match option {
+            TcpOption::SackBlocks(blocks) => Some(blocks),
+            _ => None,
+        })
+    }
+
     pub fn sack_permitted(&self) -> bool {
         self.options()
             .any(|option| matches!(option, TcpOption::SackPermitted))

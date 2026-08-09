@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::proto::tcp::wire::SackBlocks;
 use crate::{
     addr::Ipv4Addr,
     proto::{
         ipv4::{Ipv4Frame, Ipv4Payload},
         tcp::{
             congestion::Congestion,
+            pacing::Pacer,
             rtt::RoundTrip,
             seq,
             wire::{
@@ -18,12 +20,14 @@ use crate::{
     stack::tx::{TxPacket, TxQueue},
 };
 
-pub const TCP_RECV_WINDOW: u16 = 8192;
-pub const TCP_SEND_BUFFER: usize = 8192;
+pub const TCP_RECV_WINDOW: usize = 256 * 1024;
+pub const TCP_SEND_BUFFER: usize = 256 * 1024;
+pub const TCP_WINDOW_SCALE: u8 = 3;
+pub const TCP_MAX_SACK_BLOCKS: usize = 3;
 pub const TCP_TIME_WAIT: Duration = Duration::from_secs(60);
 pub const TCP_MSS_FLOOR: u16 = 536;
 pub const TCP_MAX_RETRANSMITS: u8 = 5;
-pub const TCP_MAX_OUT_OF_ORDER_SEGMENTS: usize = 16;
+pub const TCP_MAX_OUT_OF_ORDER_SEGMENTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
@@ -156,7 +160,7 @@ pub(super) fn reset_segment(
         seq,
         ack,
         flags,
-        TCP_RECV_WINDOW,
+        TCP_RECV_WINDOW.min(u16::MAX as usize) as u16,
         &[],
         vec![],
         tx,
@@ -173,9 +177,14 @@ pub(super) struct TcpConnection {
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
-    snd_wnd: u16,
+    snd_wnd: u32,
     snd_mss: u16,
     local_mss: u16,
+
+    send_scale: u8,
+    recv_scale: u8,
+    sack_permitted: bool,
+    sacked: Vec<(u32, u32)>,
     fin_seq: Option<u32>,
 
     rcv_nxt: u32,
@@ -187,6 +196,8 @@ pub(super) struct TcpConnection {
 
     round_trip: RoundTrip,
     congestion: Congestion,
+    pacer: Pacer,
+    paced_until: Option<Instant>,
     retransmit_at: Option<Instant>,
     retransmits: u8,
 
@@ -215,9 +226,13 @@ impl TcpConnection {
             iss,
             snd_una: iss,
             snd_nxt: iss.wrapping_add(1),
-            snd_wnd: TCP_RECV_WINDOW,
+            snd_wnd: u32::from(TCP_MSS_FLOOR),
             snd_mss: TCP_MSS_FLOOR.min(local_mss),
             local_mss,
+            send_scale: 0,
+            recv_scale: 0,
+            sack_permitted: false,
+            sacked: vec![],
             fin_seq: None,
             rcv_nxt: 0,
             peer_fin_seq: None,
@@ -226,6 +241,8 @@ impl TcpConnection {
             out_of_order: vec![],
             round_trip: RoundTrip::new(),
             congestion: Congestion::new(TCP_MSS_FLOOR as usize),
+            pacer: Pacer::new(),
+            paced_until: None,
             retransmit_at: None,
             retransmits: 0,
             needs_ack: false,
@@ -252,8 +269,12 @@ impl TcpConnection {
             connection.iss,
             0,
             TCP_FLAG_SYN,
-            connection.advertised_window(),
-            &[TcpOption::Mss(local_mss)],
+            connection.handshake_window(),
+            &[
+                TcpOption::Mss(local_mss),
+                TcpOption::WindowScale(TCP_WINDOW_SCALE),
+                TcpOption::SackPermitted,
+            ],
             vec![],
             tx,
         );
@@ -276,8 +297,19 @@ impl TcpConnection {
             TcpConnection::new(local_ip, handle, key, TcpState::SynReceived, local_mss);
 
         connection.rcv_nxt = syn.seq().wrapping_add(1);
-        connection.snd_wnd = syn.window();
+        connection.negotiate(syn);
+        connection.snd_wnd = u32::from(syn.window());
         connection.set_mss(negotiated_mss(syn, local_mss));
+
+        let mut options = vec![TcpOption::Mss(local_mss)];
+
+        if connection.recv_scale != 0 {
+            options.push(TcpOption::WindowScale(TCP_WINDOW_SCALE));
+        }
+
+        if connection.sack_permitted {
+            options.push(TcpOption::SackPermitted);
+        }
 
         emit(
             local_ip,
@@ -285,8 +317,8 @@ impl TcpConnection {
             connection.iss,
             connection.rcv_nxt,
             TCP_FLAG_SYN | TCP_FLAG_ACK,
-            connection.advertised_window(),
-            &[TcpOption::Mss(local_mss)],
+            connection.handshake_window(),
+            &options,
             vec![],
             tx,
         );
@@ -353,12 +385,131 @@ impl TcpConnection {
         self.retransmit_at = None;
     }
 
+    fn sacked_bytes(&self) -> usize {
+        self.sacked
+            .iter()
+            .filter(|(start, end)| seq::leq(self.snd_una, *start) && seq::leq(*end, self.snd_nxt))
+            .map(|(start, end)| end.wrapping_sub(*start) as usize)
+            .sum()
+    }
+
+    fn pipe(&self) -> usize {
+        self.flight().saturating_sub(self.sacked_bytes())
+    }
+
     fn flight(&self) -> usize {
         self.snd_nxt.wrapping_sub(self.snd_una) as usize
     }
 
+    fn receive_space(&self) -> usize {
+        TCP_RECV_WINDOW.saturating_sub(self.rx_buffer.len())
+    }
+
     fn advertised_window(&self) -> u16 {
-        (TCP_RECV_WINDOW as usize).saturating_sub(self.rx_buffer.len()) as u16
+        (self.receive_space() >> self.recv_scale).min(u16::MAX as usize) as u16
+    }
+
+    fn handshake_window(&self) -> u16 {
+        self.receive_space().min(u16::MAX as usize) as u16
+    }
+
+    fn peer_window(&self, tcp: &TcpFrame<'_>) -> u32 {
+        u32::from(tcp.window()) << self.send_scale
+    }
+
+    fn negotiate(&mut self, tcp: &TcpFrame<'_>) {
+        if let Some(scale) = tcp.window_scale() {
+            self.send_scale = scale.min(14);
+            self.recv_scale = TCP_WINDOW_SCALE;
+        }
+
+        self.sack_permitted = tcp.sack_permitted();
+    }
+
+    fn sack_options(&self) -> ([u8; TCP_MAX_SACK_BLOCKS * 8], usize) {
+        let mut encoded = [0u8; TCP_MAX_SACK_BLOCKS * 8];
+
+        if !self.sack_permitted || self.out_of_order.is_empty() {
+            return (encoded, 0);
+        }
+
+        let mut ranges: Vec<(u32, u32)> = self
+            .out_of_order
+            .iter()
+            .map(|(seq, data)| (*seq, seq.wrapping_add(data.len() as u32)))
+            .collect();
+
+        ranges.sort_by(|a, b| {
+            if seq::lt(a.0, b.0) {
+                std::cmp::Ordering::Less
+            } else if a.0 == b.0 {
+                std::cmp::Ordering::Equal
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+
+        let mut merged: Vec<(u32, u32)> = vec![];
+
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if !seq::gt(start, last.1) => {
+                    if seq::gt(end, last.1) {
+                        last.1 = end;
+                    }
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+
+        let count = merged.len().min(TCP_MAX_SACK_BLOCKS);
+
+        for (index, (start, end)) in merged.iter().take(count).enumerate() {
+            let at = index * 8;
+            encoded[at..at + 4].copy_from_slice(&start.to_be_bytes());
+            encoded[at + 4..at + 8].copy_from_slice(&end.to_be_bytes());
+        }
+
+        (encoded, count * 8)
+    }
+
+    fn remember_sack(&mut self, tcp: &TcpFrame<'_>) {
+        if !self.sack_permitted {
+            return;
+        }
+
+        let Some(blocks) = tcp.sack_blocks() else {
+            return;
+        };
+
+        for (start, end) in blocks.iter() {
+            if seq::lt(start, end)
+                && seq::leq(end, self.snd_nxt)
+                && !self.sacked.contains(&(start, end))
+            {
+                self.sacked.push((start, end));
+            }
+        }
+
+        let una = self.snd_una;
+        self.sacked.retain(|(_, end)| seq::gt(*end, una));
+    }
+
+    fn sacked_through(&self, seq_number: u32) -> Option<u32> {
+        self.sacked
+            .iter()
+            .find(|(start, end)| seq::leq(*start, seq_number) && seq::lt(seq_number, *end))
+            .map(|(_, end)| *end)
+    }
+
+    fn next_sack_hole(&self, from: u32, limit: usize) -> usize {
+        self.sacked
+            .iter()
+            .filter(|(start, _)| seq::gt(*start, from))
+            .map(|(start, _)| start.wrapping_sub(from) as usize)
+            .min()
+            .map(|distance| distance.min(limit))
+            .unwrap_or(limit)
     }
 
     pub(super) fn on_segment(
@@ -427,7 +578,8 @@ impl TcpConnection {
         }
 
         self.rcv_nxt = tcp.seq().wrapping_add(1);
-        self.snd_wnd = tcp.window();
+        self.negotiate(tcp);
+        self.snd_wnd = u32::from(tcp.window());
         self.set_mss(negotiated_mss(tcp, self.local_mss));
         self.needs_ack = true;
 
@@ -461,6 +613,7 @@ impl TcpConnection {
 
         self.send_buffer.drain(..data_acked);
         self.snd_una = ack;
+        self.sacked.retain(|(_, end)| seq::gt(*end, ack));
 
         self.round_trip.take_sample(ack, now);
         self.congestion
@@ -484,7 +637,7 @@ impl TcpConnection {
     }
 
     fn on_duplicate_ack(&mut self, now: Instant) {
-        let flight = self.flight();
+        let flight = self.pipe();
 
         if !self
             .congestion
@@ -505,13 +658,15 @@ impl TcpConnection {
     }
 
     fn on_synchronized(&mut self, tcp: &TcpFrame<'_>, now: Instant) -> SegmentOutcome {
+        self.remember_sack(tcp);
+
         if self.is_duplicate_ack(tcp) {
             self.on_duplicate_ack(now);
         } else if tcp.ack_flag() {
             self.acknowledge(tcp.ack(), now);
         }
 
-        self.snd_wnd = tcp.window();
+        self.snd_wnd = self.peer_window(tcp);
 
         let segment_len = tcp.payload().len() + usize::from(tcp.fin());
         if segment_len > 0 {
@@ -602,7 +757,7 @@ impl TcpConnection {
     }
 
     fn push_received(&mut self, payload: &[u8]) -> usize {
-        let room = TCP_RECV_WINDOW as usize - self.rx_buffer.len();
+        let room = TCP_RECV_WINDOW - self.rx_buffer.len();
         let len = payload.len().min(room);
 
         if len < payload.len() {
@@ -702,7 +857,7 @@ impl TcpConnection {
             return false;
         }
 
-        let flight = self.flight();
+        let flight = self.pipe();
         self.congestion.on_timeout(self.snd_mss as usize, flight);
 
         self.round_trip.back_off();
@@ -764,6 +919,14 @@ impl TcpConnection {
         }
 
         if self.needs_ack && !sent {
+            let (encoded, len) = self.sack_options();
+
+            let options = if len == 0 {
+                vec![]
+            } else {
+                vec![TcpOption::SackBlocks(SackBlocks(&encoded[..len]))]
+            };
+
             emit(
                 self.local_ip,
                 &self.key,
@@ -771,7 +934,7 @@ impl TcpConnection {
                 self.rcv_nxt,
                 TCP_FLAG_ACK,
                 self.advertised_window(),
-                &[],
+                &options,
                 vec![],
                 tx,
             );
@@ -793,30 +956,59 @@ impl TcpConnection {
         let mut sent = false;
         let advertised = self.advertised_window();
 
+        let mut budget = self.pacer.allowance(
+            now,
+            self.congestion.window(),
+            self.round_trip.srtt(),
+            self.snd_mss as usize,
+        );
+
         loop {
+            if let Some(through) = self.sacked_through(self.snd_nxt)
+                && seq::leq(
+                    through,
+                    self.snd_una.wrapping_add(self.send_buffer.len() as u32),
+                )
+            {
+                tracing::trace!(
+                    local_port = self.key.local_port,
+                    skipped = through.wrapping_sub(self.snd_nxt),
+                    "tcp skipping a range the peer already acknowledged"
+                );
+
+                self.snd_nxt = through;
+                continue;
+            }
+
             let offset = self.flight();
             if offset >= self.send_buffer.len() {
                 break;
             }
 
-            let send_window = (self.snd_wnd as usize).min(self.congestion.window());
-            let allowed = send_window.saturating_sub(offset);
+            let send_window = (self.snd_wnd as usize)
+                .min(self.congestion.window())
+                .min(TCP_SEND_BUFFER);
+            let allowed = send_window.saturating_sub(self.pipe());
             let available = self.send_buffer.len() - offset;
-            let len = available.min(self.snd_mss as usize).min(allowed);
+            let hole = self.next_sack_hole(self.snd_nxt, available);
+            let filling_a_hole = hole < available;
+            let len = hole
+                .min(available)
+                .min(self.snd_mss as usize)
+                .min(allowed)
+                .min(budget);
 
             if len == 0 {
                 break;
             }
 
-            if len < self.snd_mss as usize && len < available {
+            if len < self.snd_mss as usize && len < available && !filling_a_hole {
                 break;
             }
 
             let payload: Vec<u8> = self
                 .send_buffer
-                .iter()
-                .skip(offset)
-                .take(len)
+                .range(offset..offset + len)
                 .copied()
                 .collect();
 
@@ -834,8 +1026,21 @@ impl TcpConnection {
 
             self.snd_nxt = self.snd_nxt.wrapping_add(len as u32);
             self.round_trip.start_sample(self.snd_nxt, now);
+            self.pacer.consume(len);
+            budget -= len;
             sent = true;
         }
+
+        self.paced_until = if budget == 0 && self.flight() < self.send_buffer.len() {
+            self.pacer.ready_at(
+                now,
+                self.congestion.window(),
+                self.round_trip.srtt(),
+                self.snd_mss as usize,
+            )
+        } else {
+            None
+        };
 
         sent
     }
@@ -873,7 +1078,12 @@ impl TcpConnection {
     }
 
     pub(super) fn poll_at(&self) -> Option<Instant> {
-        match (self.time_wait_until, self.retransmit_at) {
+        let deadline = match (self.time_wait_until, self.retransmit_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (deadline, None) | (None, deadline) => deadline,
+        };
+
+        match (deadline, self.paced_until) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (deadline, None) | (None, deadline) => deadline,
         }
