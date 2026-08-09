@@ -12,7 +12,7 @@ use crate::{
         arp::engine::ArpEngine,
         tcp::{
             TcpConnectError, TcpEngine, TcpListenError, TcpListenerHandle, TcpSocketHandle,
-            TcpState,
+            TcpState, wire::mss_for_mtu,
         },
         udp::engine::{UdpDatagram, UdpEngine, UdpSocketBindError, UdpSocketHandle},
     },
@@ -88,12 +88,15 @@ impl Stack {
             Medium::Ip => None,
         };
 
+        let local_mss = mss_for_mtu(capabilities.mtu);
+
         tracing::info!(
             ip = ?identity.ip,
             gateway = ?identity.gateway,
             netmask = ?identity.netmask,
             medium = ?capabilities.medium,
             mtu = capabilities.mtu,
+            mss = local_mss,
             arp = arp.is_some(),
             "stack created"
         );
@@ -105,7 +108,7 @@ impl Stack {
 
             arp,
             udp: UdpEngine::default(),
-            tcp: TcpEngine::default(),
+            tcp: TcpEngine::new(local_mss),
 
             tx: TxQueue::default(),
 

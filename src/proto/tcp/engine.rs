@@ -9,7 +9,7 @@ use crate::{
         ipv4::Ipv4Frame,
         tcp::{
             connection::{ConnectionKey, SegmentOutcome, TcpConnection, TcpSocketHandle, TcpState},
-            wire::TcpFrame,
+            wire::{TCP_MSS_DEFAULT, TcpFrame},
         },
     },
     stack::tx::TxQueue,
@@ -36,8 +36,9 @@ struct TcpListener {
     backlog: VecDeque<TcpSocketHandle>,
 }
 
-#[derive(Default)]
 pub struct TcpEngine {
+    local_mss: u16,
+
     next_handle: usize,
 
     connections: HashMap<ConnectionKey, TcpConnection>,
@@ -47,7 +48,24 @@ pub struct TcpEngine {
     listener_ports: HashMap<TcpListenerHandle, u16>,
 }
 
+impl Default for TcpEngine {
+    fn default() -> TcpEngine {
+        TcpEngine::new(TCP_MSS_DEFAULT)
+    }
+}
+
 impl TcpEngine {
+    pub fn new(local_mss: u16) -> TcpEngine {
+        TcpEngine {
+            local_mss,
+            next_handle: 0,
+            connections: HashMap::new(),
+            handles: HashMap::new(),
+            listeners: HashMap::new(),
+            listener_ports: HashMap::new(),
+        }
+    }
+
     fn next_handle(&mut self) -> usize {
         let handle = self.next_handle;
         self.next_handle += 1;
@@ -131,7 +149,7 @@ impl TcpEngine {
         );
 
         let handle = TcpSocketHandle(self.next_handle());
-        let connection = TcpConnection::connect(local_ip, handle, key, now, tx);
+        let connection = TcpConnection::connect(local_ip, handle, key, self.local_mss, now, tx);
 
         self.connections.insert(key, connection);
         self.handles.insert(handle, key);
@@ -179,7 +197,8 @@ impl TcpEngine {
             );
 
             let handle = TcpSocketHandle(self.next_handle());
-            let connection = TcpConnection::accept(local_ip, handle, key, tcp_frame, now, tx);
+            let connection =
+                TcpConnection::accept(local_ip, handle, key, tcp_frame, self.local_mss, now, tx);
 
             self.connections.insert(key, connection);
             self.handles.insert(handle, key);

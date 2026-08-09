@@ -50,6 +50,55 @@ fn linked_pair() -> (Net, Net) {
     (alice, bob)
 }
 
+fn linked_pair_with_mtu(mtu: usize) -> (Net, Net) {
+    init_tracing();
+
+    let (alice_device, bob_device) = LoopbackDevice::pair(Medium::Ip, Medium::Ip);
+
+    let (alice, alice_driver) = smolnet::net::build(identity(ALICE_IP), alice_device.with_mtu(mtu));
+    let (bob, bob_driver) = smolnet::net::build(identity(BOB_IP), bob_device.with_mtu(mtu));
+
+    tokio::spawn(alice_driver.run());
+    tokio::spawn(bob_driver.run());
+
+    (alice, bob)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_with_a_small_mtu_still_carries_a_stream() {
+    let (alice, bob) = linked_pair_with_mtu(1280);
+
+    let listener = alice.tcp_listen(7878).unwrap();
+
+    tokio::spawn(async move {
+        let socket = listener.accept().await.unwrap();
+        let (mut reader, mut writer) = tokio::io::split(socket);
+
+        tokio::io::copy(&mut reader, &mut writer).await.unwrap();
+    });
+
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let client = bob.tcp_connect(ALICE_IP, 7878).await.unwrap();
+    let (mut reader, mut writer) = tokio::io::split(client);
+
+    let sender = tokio::spawn(async move {
+        writer.write_all(&payload).await.unwrap();
+        writer.shutdown().await.unwrap();
+    });
+
+    let mut received = vec![];
+    tokio::time::timeout(Duration::from_secs(20), reader.read_to_end(&mut received))
+        .await
+        .expect("segments sized for the link never need retransmission")
+        .unwrap();
+
+    sender.await.unwrap();
+
+    assert_eq!(received, expected);
+}
+
 #[tokio::test]
 async fn tcp_echo_round_trip() {
     let (alice, bob) = linked_pair();

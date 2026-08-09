@@ -1,0 +1,27 @@
+[package]
+name = "smolctl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+smolmesh = { path = "../smolmesh" }
+smolnet = { path = ".." }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "io-std"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[[bin]]
+name = "smolctl"
+path = "src/bin/smolctl.rs"

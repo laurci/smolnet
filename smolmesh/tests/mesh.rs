@@ -1,0 +1,466 @@
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use smolmesh::{Membership, MeshDevice, MeshHandle, NetworkId, NodeId, Peer, Reflector};
+use smolnet::{
+    net::Net,
+    proto::{
+        ipv4::{Ipv4Frame, Ipv4Payload},
+        udp::wire::UdpFrame,
+    },
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
+
+const ECHO_PORT: u16 = 7878;
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+struct Node {
+    net: Net,
+    handle: MeshHandle,
+    id: NodeId,
+    ip: Ipv4Addr,
+    endpoint: SocketAddr,
+}
+
+async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
+    init_tracing();
+
+    let network = NetworkId::random();
+    let mut nodes = vec![];
+
+    for index in 0..size {
+        let id = NodeId::random();
+        let ip = Ipv4Addr::new(10, 30, 0, 2 + index as u8);
+
+        let membership = Membership::new(network, id, ip);
+
+        let (device, handle) = MeshDevice::bind("127.0.0.1:0", &membership).await.unwrap();
+        let endpoint = handle.local_addr().unwrap();
+
+        let (net, driver) = smolnet::net::build(membership.stack_identity(), device);
+        tokio::spawn(driver.run());
+
+        nodes.push(Node {
+            net,
+            handle,
+            id,
+            ip,
+            endpoint,
+        });
+    }
+
+    let roster: Vec<Peer> = nodes
+        .iter()
+        .map(|node| Peer::new(node.id, node.ip).with_endpoint(node.endpoint))
+        .collect();
+
+    for node in &nodes {
+        node.handle
+            .peers()
+            .replace_all(roster.iter().filter(|p| p.node != node.id).cloned());
+    }
+
+    (network, nodes)
+}
+
+fn spawn_echo(net: &Net, port: u16) {
+    let listener = net.tcp_listen(port).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let socket = listener.accept().await.unwrap();
+
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tokio::io::split(socket);
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+}
+
+fn udp_packet(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, body: &[u8]) -> Vec<u8> {
+    let frame = Ipv4Frame::new(
+        src.octets(),
+        dst.octets(),
+        Ipv4Payload::Udp(UdpFrame::new(4000, dst_port, body)),
+    );
+
+    let mut bytes = vec![0u8; frame.size()];
+    frame.write(&mut bytes);
+
+    bytes
+}
+
+async fn send_datagram(
+    socket: &UdpSocket,
+    to: SocketAddr,
+    network: NetworkId,
+    sender: NodeId,
+    packet: &[u8],
+) {
+    let datagram =
+        smolmesh::wire::Datagram::new(smolmesh::wire::MessageType::Data, network, sender, packet);
+
+    let mut bytes = vec![0u8; datagram.size()];
+    datagram.write(&mut bytes);
+
+    socket.send_to(&bytes, to).await.unwrap();
+}
+
+async fn assert_no_delivery(net: &Net, port: u16) {
+    let socket = net.udp_bind(Some(port)).unwrap();
+    let mut buf = [0u8; 128];
+
+    let result = tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await;
+
+    assert!(result.is_err(), "the datagram should never have arrived");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_node_reaches_every_other_node() {
+    let (_, nodes) = mesh(3).await;
+
+    for node in &nodes {
+        spawn_echo(&node.net, ECHO_PORT);
+    }
+
+    for client in &nodes {
+        for server in &nodes {
+            if client.id == server.id {
+                continue;
+            }
+
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.net.tcp_connect(server.ip, ECHO_PORT),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{} -> {} connected", client.ip, server.ip))
+            .unwrap();
+
+            let message = format!("{} to {}", client.ip, server.ip);
+            stream.write_all(message.as_bytes()).await.unwrap();
+
+            let mut buf = vec![0u8; message.len()];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+                .await
+                .expect("the echo came back")
+                .unwrap();
+
+            assert_eq!(buf, message.as_bytes());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_stream_survives_the_overlay_mtu() {
+    let (_, nodes) = mesh(2).await;
+
+    spawn_echo(&nodes[0].net, ECHO_PORT);
+
+    let payload: Vec<u8> = (0..192 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let stream = nodes[1]
+        .net
+        .tcp_connect(nodes[0].ip, ECHO_PORT)
+        .await
+        .unwrap();
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let sender = tokio::spawn(async move {
+        writer.write_all(&payload).await.unwrap();
+        writer.shutdown().await.unwrap();
+    });
+
+    let mut received = vec![];
+    tokio::time::timeout(Duration::from_secs(30), reader.read_to_end(&mut received))
+        .await
+        .expect("the transfer did not time out")
+        .unwrap();
+
+    sender.await.unwrap();
+
+    assert_eq!(received, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datagram_from_an_unknown_node_is_dropped() {
+    let (network, nodes) = mesh(2).await;
+
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let packet = udp_packet(nodes[1].ip, nodes[0].ip, ECHO_PORT, b"let me in");
+
+    send_datagram(
+        &outsider,
+        nodes[0].endpoint,
+        network,
+        NodeId::random(),
+        &packet,
+    )
+    .await;
+
+    assert_no_delivery(&nodes[0].net, ECHO_PORT).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datagram_for_another_network_is_dropped() {
+    let (_, nodes) = mesh(2).await;
+
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let packet = udp_packet(nodes[1].ip, nodes[0].ip, ECHO_PORT, b"wrong network");
+
+    send_datagram(
+        &outsider,
+        nodes[0].endpoint,
+        NetworkId::random(),
+        nodes[1].id,
+        &packet,
+    )
+    .await;
+
+    assert_no_delivery(&nodes[0].net, ECHO_PORT).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_cannot_spoof_another_peers_address() {
+    let (network, nodes) = mesh(3).await;
+
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let packet = udp_packet(nodes[2].ip, nodes[0].ip, ECHO_PORT, b"not mine to send");
+
+    send_datagram(&outsider, nodes[0].endpoint, network, nodes[1].id, &packet).await;
+
+    assert_no_delivery(&nodes[0].net, ECHO_PORT).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_known_peer_is_delivered() {
+    let (network, nodes) = mesh(2).await;
+
+    let socket = nodes[0].net.udp_bind(Some(ECHO_PORT)).unwrap();
+
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let packet = udp_packet(nodes[1].ip, nodes[0].ip, ECHO_PORT, b"hello neighbour");
+
+    send_datagram(&outsider, nodes[0].endpoint, network, nodes[1].id, &packet).await;
+
+    let mut buf = [0u8; 128];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+        .await
+        .expect("the datagram arrived")
+        .unwrap();
+
+    assert_eq!(&buf[..len], b"hello neighbour");
+    assert_eq!(from.ip(), std::net::IpAddr::V4(nodes[1].ip));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_is_learned_from_inbound_traffic() {
+    let (_, nodes) = mesh(2).await;
+
+    let peers = nodes[0].handle.peers();
+    peers.insert(Peer::new(nodes[1].id, nodes[1].ip));
+
+    assert_eq!(
+        peers.route(&nodes[1].ip),
+        None,
+        "the first node has forgotten how to reach the second"
+    );
+
+    spawn_echo(&nodes[0].net, ECHO_PORT);
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        nodes[1].net.tcp_connect(nodes[0].ip, ECHO_PORT),
+    )
+    .await
+    .expect("the handshake completed")
+    .unwrap();
+
+    stream.write_all(b"punched").await.unwrap();
+
+    let mut buf = [0u8; 7];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("the echo came back")
+        .unwrap();
+
+    assert_eq!(
+        peers.route(&nodes[1].ip),
+        Some(nodes[1].endpoint),
+        "the endpoint was learned from the incoming handshake"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keepalive_teaches_an_endpoint_without_carrying_traffic() {
+    let (_, nodes) = mesh(2).await;
+
+    let peers = nodes[0].handle.peers();
+    peers.insert(Peer::new(nodes[1].id, nodes[1].ip));
+
+    assert_eq!(peers.route(&nodes[1].ip), None);
+
+    nodes[1].handle.keepalive(nodes[0].endpoint).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while peers.route(&nodes[1].ip).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the keepalive taught the endpoint");
+
+    assert_eq!(peers.route(&nodes[1].ip), Some(nodes[1].endpoint));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packet_for_an_unreachable_address_is_dropped_without_killing_the_link() {
+    let (_, nodes) = mesh(2).await;
+
+    let sender = nodes[0].net.udp_bind(Some(4100)).unwrap();
+    sender
+        .send_to(b"nobody home", Ipv4Addr::new(10, 30, 0, 200), 9999)
+        .unwrap();
+
+    spawn_echo(&nodes[1].net, ECHO_PORT);
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        nodes[0].net.tcp_connect(nodes[1].ip, ECHO_PORT),
+    )
+    .await
+    .expect("the link still works")
+    .unwrap();
+
+    stream.write_all(b"still here").await.unwrap();
+
+    let mut buf = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("the echo came back")
+        .unwrap();
+
+    assert_eq!(&buf, b"still here");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broadcast_reaches_every_peer() {
+    let (_, nodes) = mesh(3).await;
+
+    let listeners: Vec<_> = nodes[1..]
+        .iter()
+        .map(|node| node.net.udp_bind(Some(4200)).unwrap())
+        .collect();
+
+    let sender = nodes[0].net.udp_bind(Some(4201)).unwrap();
+
+    for listener in &listeners {
+        let mut buf = [0u8; 64];
+
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                sender
+                    .send_to(b"anyone there", Ipv4Addr::new(10, 30, 0, 255), 4200)
+                    .unwrap();
+
+                if let Ok(Ok(received)) =
+                    tokio::time::timeout(Duration::from_millis(200), listener.recv_from(&mut buf))
+                        .await
+                {
+                    break received;
+                }
+            }
+        })
+        .await
+        .expect("the broadcast arrived");
+
+        assert_eq!(&buf[..received.0], b"anyone there");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overlay_mtu_is_advertised_to_the_stack() {
+    let (_, nodes) = mesh(1).await;
+
+    assert_eq!(nodes[0].net.capabilities().mtu, smolmesh::MESH_MTU);
+    assert_eq!(
+        nodes[0].net.capabilities().medium,
+        smolnet::device::Medium::Ip
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reflector_reports_the_endpoint_it_observes() {
+    let (_, nodes) = mesh(1).await;
+
+    let reflector = Reflector::bind("127.0.0.1:0").await.unwrap();
+    let address = reflector.local_addr().unwrap();
+    tokio::spawn(reflector.run());
+
+    let mut observed = nodes[0].handle.observe();
+    assert!(observed.borrow().is_empty());
+
+    nodes[0].handle.probe(address).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), observed.changed())
+        .await
+        .expect("the reflection came back")
+        .unwrap();
+
+    assert_eq!(
+        observed.borrow().reflected,
+        Some(nodes[0].endpoint),
+        "the reflector saw the address our mesh socket sends from"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_answers_a_probe_like_a_reflector() {
+    let (_, nodes) = mesh(2).await;
+
+    let mut observed = nodes[0].handle.observe();
+    nodes[0].handle.probe(nodes[1].endpoint).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), observed.changed())
+        .await
+        .expect("the peer answered the probe")
+        .unwrap();
+
+    assert_eq!(observed.borrow().reflected, Some(nodes[0].endpoint));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reflection_for_another_network_is_ignored() {
+    let (_, nodes) = mesh(1).await;
+
+    let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = smolmesh::wire::encode_endpoint("1.2.3.4:5678".parse().unwrap());
+
+    let datagram = smolmesh::wire::Datagram::new(
+        smolmesh::wire::MessageType::Reflection,
+        NetworkId::random(),
+        NodeId::random(),
+        &payload[..],
+    );
+
+    let mut bytes = vec![0u8; datagram.size()];
+    datagram.write(&mut bytes);
+    outsider.send_to(&bytes, nodes[0].endpoint).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(nodes[0].handle.observed().is_empty());
+}

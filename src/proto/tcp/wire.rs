@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use net_header::{Checksum, NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
-use crate::proto::options::{OptionsTooLong, TcpOptions};
+use crate::proto::{
+    ipv4::Ipv4Header,
+    options::{OptionsTooLong, TcpOptions},
+};
 
 pub const TCP_OPTION_END: u8 = 0;
 pub const TCP_OPTION_NOP: u8 = 1;
@@ -14,6 +17,11 @@ pub const TCP_OPTION_SACK_BLOCKS: u8 = 5;
 pub const TCP_OPTION_TIMESTAMPS: u8 = 8;
 
 pub const TCP_MSS_DEFAULT: u16 = 1460;
+
+pub fn mss_for_mtu(mtu: usize) -> u16 {
+    mtu.saturating_sub(Ipv4Header::SIZE + TcpHeader::SIZE)
+        .clamp(1, TCP_MSS_DEFAULT as usize) as u16
+}
 
 const TCP_MIN_DATA_OFFSET: u8 = 5;
 const TCP_MAX_DATA_OFFSET: u8 = 15;
@@ -504,8 +512,27 @@ mod test {
 
     use crate::proto::tcp::wire::{
         SackBlocks, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
-        TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr,
+        TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr, mss_for_mtu,
     };
+
+    #[test]
+    fn the_mss_leaves_room_for_the_ipv4_and_tcp_headers() {
+        assert_eq!(mss_for_mtu(1500), TCP_MSS_DEFAULT);
+        assert_eq!(mss_for_mtu(1280), 1240);
+        assert_eq!(mss_for_mtu(576), 536);
+    }
+
+    #[test]
+    fn the_mss_never_exceeds_the_default() {
+        assert_eq!(mss_for_mtu(9000), TCP_MSS_DEFAULT);
+    }
+
+    #[test]
+    fn an_unusable_mtu_still_yields_a_sendable_segment() {
+        for mtu in 0..=40 {
+            assert_eq!(mss_for_mtu(mtu), 1, "mtu = {mtu}");
+        }
+    }
 
     fn encode(frame: &TcpFrame<'_>) -> Vec<u8> {
         let mut bytes = vec![0u8; frame.size()];

@@ -10,8 +10,8 @@ use crate::{
             rtt::RoundTrip,
             seq,
             wire::{
-                TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
-                TCP_MSS_DEFAULT, TcpFrame, TcpOption, TcpRepr,
+                TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TcpFrame,
+                TcpOption, TcpRepr,
             },
         },
     },
@@ -73,8 +73,8 @@ pub(super) enum SegmentOutcome {
     Dead,
 }
 
-fn negotiated_mss(tcp: &TcpFrame<'_>) -> u16 {
-    tcp.mss().unwrap_or(TCP_MSS_FLOOR).min(TCP_MSS_DEFAULT)
+fn negotiated_mss(tcp: &TcpFrame<'_>, local_mss: u16) -> u16 {
+    tcp.mss().unwrap_or(TCP_MSS_FLOOR).min(local_mss)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,6 +175,7 @@ pub(super) struct TcpConnection {
     snd_nxt: u32,
     snd_wnd: u16,
     snd_mss: u16,
+    local_mss: u16,
     fin_seq: Option<u32>,
 
     rcv_nxt: u32,
@@ -202,6 +203,7 @@ impl TcpConnection {
         handle: TcpSocketHandle,
         key: ConnectionKey,
         state: TcpState,
+        local_mss: u16,
     ) -> TcpConnection {
         let iss: u32 = rand::random();
 
@@ -214,7 +216,8 @@ impl TcpConnection {
             snd_una: iss,
             snd_nxt: iss.wrapping_add(1),
             snd_wnd: TCP_RECV_WINDOW,
-            snd_mss: TCP_MSS_FLOOR,
+            snd_mss: TCP_MSS_FLOOR.min(local_mss),
+            local_mss,
             fin_seq: None,
             rcv_nxt: 0,
             peer_fin_seq: None,
@@ -236,10 +239,12 @@ impl TcpConnection {
         local_ip: Ipv4Addr,
         handle: TcpSocketHandle,
         key: ConnectionKey,
+        local_mss: u16,
         now: Instant,
         tx: &mut TxQueue,
     ) -> TcpConnection {
-        let mut connection = TcpConnection::new(local_ip, handle, key, TcpState::SynSent);
+        let mut connection =
+            TcpConnection::new(local_ip, handle, key, TcpState::SynSent, local_mss);
 
         emit(
             local_ip,
@@ -248,7 +253,7 @@ impl TcpConnection {
             0,
             TCP_FLAG_SYN,
             connection.advertised_window(),
-            &[TcpOption::Mss(TCP_MSS_DEFAULT)],
+            &[TcpOption::Mss(local_mss)],
             vec![],
             tx,
         );
@@ -263,14 +268,16 @@ impl TcpConnection {
         handle: TcpSocketHandle,
         key: ConnectionKey,
         syn: &TcpFrame<'_>,
+        local_mss: u16,
         now: Instant,
         tx: &mut TxQueue,
     ) -> TcpConnection {
-        let mut connection = TcpConnection::new(local_ip, handle, key, TcpState::SynReceived);
+        let mut connection =
+            TcpConnection::new(local_ip, handle, key, TcpState::SynReceived, local_mss);
 
         connection.rcv_nxt = syn.seq().wrapping_add(1);
         connection.snd_wnd = syn.window();
-        connection.set_mss(negotiated_mss(syn));
+        connection.set_mss(negotiated_mss(syn, local_mss));
 
         emit(
             local_ip,
@@ -279,7 +286,7 @@ impl TcpConnection {
             connection.rcv_nxt,
             TCP_FLAG_SYN | TCP_FLAG_ACK,
             connection.advertised_window(),
-            &[TcpOption::Mss(TCP_MSS_DEFAULT)],
+            &[TcpOption::Mss(local_mss)],
             vec![],
             tx,
         );
@@ -421,7 +428,7 @@ impl TcpConnection {
 
         self.rcv_nxt = tcp.seq().wrapping_add(1);
         self.snd_wnd = tcp.window();
-        self.set_mss(negotiated_mss(tcp));
+        self.set_mss(negotiated_mss(tcp, self.local_mss));
         self.needs_ack = true;
 
         self.acknowledge(tcp.ack(), now);
@@ -719,7 +726,7 @@ impl TcpConnection {
                 0,
                 TCP_FLAG_SYN,
                 window,
-                &[TcpOption::Mss(TCP_MSS_DEFAULT)],
+                &[TcpOption::Mss(self.local_mss)],
                 vec![],
                 tx,
             ),
@@ -730,7 +737,7 @@ impl TcpConnection {
                 self.rcv_nxt,
                 TCP_FLAG_SYN | TCP_FLAG_ACK,
                 window,
-                &[TcpOption::Mss(TCP_MSS_DEFAULT)],
+                &[TcpOption::Mss(self.local_mss)],
                 vec![],
                 tx,
             ),

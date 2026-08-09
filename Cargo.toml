@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["net_header", "net_header/meta", "."]
+members = ["net_header", "net_header/meta", "smolctl", "smolmesh", "."]
 
 [features]
 axum = ["dep:axum"]

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package smolctl.v1;
+
+service Control {
+  rpc Session(stream ClientMessage) returns (stream ServerMessage);
+}
+
+message ClientMessage {
+  oneof body {
+    Endpoints endpoints = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message Endpoints {
+  repeated string candidates = 1;
+}
+
+message Heartbeat {}
+
+message ServerMessage {
+  oneof body {
+    Welcome welcome = 1;
+    PeerState peer = 2;
+    PeerGone gone = 3;
+  }
+}
+
+message Welcome {
+  string network = 1;
+  string node = 2;
+  string ip = 3;
+  string netmask = 4;
+  string reflector = 5;
+  repeated PeerState peers = 6;
+}
+
+message PeerState {
+  string node = 1;
+  string ip = 2;
+  repeated string endpoints = 3;
+  bool online = 4;
+}
+
+message PeerGone {
+  string node = 1;
+}
