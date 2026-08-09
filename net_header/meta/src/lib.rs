@@ -22,9 +22,8 @@ struct NetHeaderField {
 }
 
 #[derive(Default)]
-struct FieldGeneartorState {
+struct FieldGeneratorState {
     offset: usize,
-    checksum_offset: Option<usize>,
 }
 
 fn extract_type_path_numeric_info(tp: &TypePath) -> Option<NumericInfo> {
@@ -143,7 +142,7 @@ fn parse_header_field_info(field: &NetHeaderField) -> Option<HeaderFieldInfo> {
 }
 
 fn gen_decoder_for_field(
-    state: &mut FieldGeneartorState,
+    state: &mut FieldGeneratorState,
     opts: &NetHeaderOpts,
     field: &NetHeaderField,
 ) -> proc_macro2::TokenStream {
@@ -195,7 +194,7 @@ fn gen_decoder_for_field(
 }
 
 fn gen_encoder_for_field(
-    state: &mut FieldGeneartorState,
+    state: &mut FieldGeneratorState,
     opts: &NetHeaderOpts,
     field: &NetHeaderField,
 ) -> proc_macro2::TokenStream {
@@ -233,21 +232,44 @@ fn gen_encoder_for_field(
                 info.bytes,
             )
         }
-        HeaderFieldInfo::Checksum => {
-            state.checksum_offset = Some(offset);
-
-            (
-                quote! {
-                    let offset = ::net_header::write::write_field_u16(0, #field_name, bytes, #offset);
-                },
-                2,
-            )
-        }
+        HeaderFieldInfo::Checksum => (
+            quote! {
+                let offset = ::net_header::write::write_field_u16(self.#field_ident, #field_name, bytes, #offset);
+            },
+            2,
+        ),
     };
 
     state.offset += advance;
 
     impl_.into()
+}
+
+fn gen_fold_for_field(opts: &NetHeaderOpts, field: &NetHeaderField) -> proc_macro2::TokenStream {
+    let Some(field_ident) = &field.ident else {
+        abort!(field.ident, "only named fields are supported");
+    };
+
+    let Some(field_info) = parse_header_field_info(field) else {
+        abort! { field.ident,
+                "unsupported field type {}", field.ty.to_token_stream().to_string();
+                note = "headers only support numeric types (u8, i16, u32, ..) and fixed size byte slices ([u8; N])"
+        };
+    };
+
+    let _ = opts;
+
+    match field_info {
+        HeaderFieldInfo::Slice { .. } => quote! {
+            checksum.push(&self.#field_ident);
+        },
+        HeaderFieldInfo::Numeric(_) => quote! {
+            checksum.push(&self.#field_ident.to_be_bytes());
+        },
+        HeaderFieldInfo::Checksum => quote! {
+            checksum.push_u16(0);
+        },
+    }
 }
 
 #[proc_macro_derive(NetHeader, attributes(header))]
@@ -275,29 +297,22 @@ pub fn net_header_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStr
         .expect("Should never be enum")
         .fields;
 
-    let mut decoder_gen_state = FieldGeneartorState::default();
-    let mut encoder_gen_state = FieldGeneartorState::default();
+    let mut decoder_gen_state = FieldGeneratorState::default();
+    let mut encoder_gen_state = FieldGeneratorState::default();
 
     let mut struct_assembly_fields = vec![];
     let mut decoder_field_impls = vec![];
     let mut encoder_field_impls = vec![];
+    let mut fold_field_impls = vec![];
 
     for field in fields {
         struct_assembly_fields.push(field.ident.clone().unwrap());
         decoder_field_impls.push(gen_decoder_for_field(&mut decoder_gen_state, &opts, field));
         encoder_field_impls.push(gen_encoder_for_field(&mut encoder_gen_state, &opts, field));
+        fold_field_impls.push(gen_fold_for_field(&opts, field));
     }
 
     let size = encoder_gen_state.offset;
-
-    let checksum_writeback_name = format!("{}.checksum_writeback", opts.name);
-    let checksum_writeback_impl = match encoder_gen_state.checksum_offset {
-        Some(checksum_offset) => quote! {
-            let computed_checksum__ = ::net_header::checksum(&bytes[..offset]);
-            ::net_header::write::write_field_u16(computed_checksum__, #checksum_writeback_name, bytes, #checksum_offset);
-        },
-        None => quote! {},
-    };
 
     let impl_ = quote! {
         impl ::net_header::NetHeader for #ident {
@@ -316,9 +331,11 @@ pub fn net_header_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStr
             fn write(&self, bytes: &mut [u8]) -> usize {
                 #( #encoder_field_impls )*
 
-                #checksum_writeback_impl
-
                 offset
+            }
+
+            fn fold(&self, checksum: &mut ::net_header::Checksum) {
+                #( #fold_field_impls )*
             }
         }
     };

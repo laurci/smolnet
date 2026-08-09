@@ -1,36 +1,32 @@
 use std::time::Duration;
 
-use crate::{
-    addr::MacAddr,
-    device::{
-        Device, DeviceCapabilities, DeviceError, Medium,
-        tuntap::{IFF_NO_PI, IFF_TAP, TunTapDevice, TunTapOpenError},
-    },
+use crate::device::{
+    Device, DeviceCapabilities, DeviceError, Medium,
+    tuntap::{IFF_NO_PI, IFF_TUN, TunTapDevice, TunTapOpenError},
 };
 
-pub use crate::device::tuntap::TunTapOpenError as TapDeviceOpenError;
+pub use crate::device::tuntap::TunTapOpenError as TunDeviceOpenError;
 
-pub struct TapDevice {
+pub struct TunDevice {
     inner: TunTapDevice,
 }
 
-impl TapDevice {
-    pub fn open(interface_name: &str, mac: MacAddr) -> Result<TapDevice, TunTapOpenError> {
-        let capabilities = DeviceCapabilities::new(Medium::Ethernet { mac });
-        let inner = TunTapDevice::open(interface_name, IFF_TAP | IFF_NO_PI, capabilities)?;
+impl TunDevice {
+    pub fn open(interface_name: &str) -> Result<TunDevice, TunTapOpenError> {
+        let capabilities = DeviceCapabilities::new(Medium::Ip);
+        let inner = TunTapDevice::open(interface_name, IFF_TUN | IFF_NO_PI, capabilities)?;
 
         tracing::info!(
             interface = interface_name,
-            ?mac,
             mtu = capabilities.mtu,
-            "tap device opened"
+            "tun device opened"
         );
 
-        Ok(TapDevice { inner })
+        Ok(TunDevice { inner })
     }
 }
 
-impl Device for TapDevice {
+impl Device for TunDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         self.inner.capabilities()
     }

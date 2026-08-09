@@ -2,8 +2,8 @@ use net_header::{NetHeader, parse::HeaderParseError};
 use thiserror::Error;
 
 use crate::{
-    addr::{Ipv4Addr, MacAddr},
-    parser::ethernet::ETHER_TYPE_IPV4,
+    addr::{BROADCAST_MAC, Ipv4Addr, MacAddr, UNSPECIFIED_MAC},
+    proto::eth::ETHER_TYPE_IPV4,
 };
 
 pub const ARP_OPERATION_REQUEST: u16 = 1;
@@ -67,8 +67,7 @@ pub struct ArpFrame {
 
 impl ArpFrame {
     pub fn parse(bytes: &[u8]) -> Result<Self, ArpFrameParseError> {
-        let header =
-            ArpHeader::from_bytes(bytes).map_err(|e| ArpFrameParseError::HeaderParseError(e))?;
+        let header = ArpHeader::from_bytes(bytes).map_err(ArpFrameParseError::HeaderParseError)?;
 
         if header.h_type != ARP_H_TYPE_ETHERNET {
             return Err(ArpFrameParseError::UnsupportedHardwareType(header.h_type));
@@ -91,34 +90,36 @@ impl ArpFrame {
         }
 
         let operation = match header.operation {
-            ARP_OPERATION_REQUEST => {
-                let request = ArpRequest { header };
-                ArpOperation::Request(request)
-            }
-            ARP_OPERATION_REPLY => {
-                let reply = ArpReply { header };
-                ArpOperation::Reply(reply)
-            }
+            ARP_OPERATION_REQUEST => ArpOperation::Request(ArpRequest { header }),
+            ARP_OPERATION_REPLY => ArpOperation::Reply(ArpReply { header }),
             unknown_value => return Err(ArpFrameParseError::UnknownArpOperation(unknown_value)),
         };
 
-        let frame = ArpFrame { operation };
-
-        Ok(frame)
+        Ok(ArpFrame { operation })
     }
 
     pub fn new(operation: ArpOperation) -> Self {
         ArpFrame { operation }
     }
 
-    pub fn write(self, bytes: &mut [u8]) -> usize {
-        let header = match self.operation {
-            ArpOperation::Request(req) => req.header,
-            ArpOperation::Reply(reply) => reply.header,
+    pub fn write(&self, bytes: &mut [u8]) -> usize {
+        let header = match &self.operation {
+            ArpOperation::Request(request) => &request.header,
+            ArpOperation::Reply(reply) => &reply.header,
         };
 
-        let size = header.write(bytes);
-        size
+        header.write(bytes)
+    }
+
+    pub fn size(&self) -> usize {
+        ArpHeader::SIZE
+    }
+
+    pub fn link_dst(&self) -> MacAddr {
+        match &self.operation {
+            ArpOperation::Request(_) => BROADCAST_MAC,
+            ArpOperation::Reply(reply) => *reply.target_hardware_addr(),
+        }
     }
 }
 
@@ -145,7 +146,7 @@ impl ArpRequest {
             sender_h_addr: sender_hardware_addr,
             sender_p_addr: sender_proto_addr,
 
-            target_h_addr: [0u8; 6],
+            target_h_addr: UNSPECIFIED_MAC,
             target_p_addr: target_proto_addr,
         };
 
@@ -212,9 +213,12 @@ impl ArpReply {
 mod test {
     use net_header::NetHeader;
 
-    use crate::parser::{
-        arp::{ArpFrame, ArpHeader, ArpOperation, ArpReply, ArpRequest},
-        ethernet::{EthernetFrame, EthernetHeader, EthernetPayload},
+    use crate::{
+        addr::BROADCAST_MAC,
+        proto::{
+            arp::wire::{ArpFrame, ArpHeader, ArpOperation, ArpReply, ArpRequest},
+            eth::{EthernetFrame, EthernetHeader, EthernetPayload},
+        },
     };
 
     #[test]
@@ -228,13 +232,13 @@ mod test {
         let sent_frame = EthernetFrame::new(
             alice_mac,
             bob_mac,
-            EthernetPayload::Arp(ArpFrame::new(super::ArpOperation::Request(
-                ArpRequest::new(alice_mac, alice_ip, bob_ip),
-            ))),
+            EthernetPayload::Arp(ArpFrame::new(ArpOperation::Request(ArpRequest::new(
+                alice_mac, alice_ip, bob_ip,
+            )))),
         );
 
         let mut sent_bytes = [0u8; EthernetHeader::SIZE + ArpHeader::SIZE];
-        let sent_size = sent_frame.clone().write(&mut sent_bytes);
+        let sent_size = sent_frame.write(&mut sent_bytes);
         assert_eq!(sent_size, sent_bytes.len());
 
         let recv_frame = EthernetFrame::parse(&sent_bytes).unwrap();
@@ -242,7 +246,7 @@ mod test {
 
         let EthernetPayload::Arp(ArpFrame {
             operation: ArpOperation::Request(arp_request),
-        }) = recv_frame.payload.clone()
+        }) = recv_frame.into_payload()
         else {
             panic!("req recv_frame is invalid");
         };
@@ -255,7 +259,7 @@ mod test {
         );
 
         let mut sent_bytes = [0u8; EthernetHeader::SIZE + ArpHeader::SIZE];
-        let sent_size = sent_frame.clone().write(&mut sent_bytes);
+        let sent_size = sent_frame.write(&mut sent_bytes);
         assert_eq!(sent_size, sent_bytes.len());
 
         let recv_frame = EthernetFrame::parse(&sent_bytes).unwrap();
@@ -263,9 +267,35 @@ mod test {
 
         let EthernetPayload::Arp(ArpFrame {
             operation: ArpOperation::Reply(_arp_reply),
-        }) = recv_frame.payload.clone()
+        }) = recv_frame.into_payload()
         else {
             panic!("reply recv_frame is invalid");
         };
+    }
+
+    #[test]
+    fn link_dst() {
+        let alice_mac = [0, 1, 2, 3, 4, 5];
+        let bob_mac = [6, 7, 8, 9, 10, 11];
+
+        let request = ArpRequest::new(alice_mac, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let request_frame = ArpFrame::new(ArpOperation::Request(request.clone()));
+        assert_eq!(request_frame.link_dst(), BROADCAST_MAC);
+
+        let reply_frame = ArpFrame::new(ArpOperation::Reply(ArpReply::new(&request, bob_mac)));
+        assert_eq!(reply_frame.link_dst(), alice_mac);
+    }
+
+    #[test]
+    fn rejects_truncated_frame() {
+        let request = ArpRequest::new([0, 1, 2, 3, 4, 5], [10, 0, 0, 1], [10, 0, 0, 2]);
+        let frame = ArpFrame::new(ArpOperation::Request(request));
+
+        let mut bytes = [0u8; ArpHeader::SIZE];
+        let size = frame.write(&mut bytes);
+
+        for len in 0..size {
+            assert!(ArpFrame::parse(&bytes[..len]).is_err(), "len = {len}");
+        }
     }
 }

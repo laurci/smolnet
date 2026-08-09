@@ -5,7 +5,7 @@ pub enum HeaderParseError {
     #[error(
         "invalid length while parsing field '{field_name}' (expected = {expected_length}; found = {actual_length})"
     )]
-    InvalidLenghtForField {
+    InvalidLengthForField {
         field_name: &'static str,
         expected_length: usize,
         actual_length: usize,
@@ -17,15 +17,20 @@ pub fn read_field_slice<const N: usize>(
     input: &[u8],
     offset: usize,
 ) -> Result<[u8; N], HeaderParseError> {
-    let slice = &input[offset..(offset + N)];
-    let actual_length = slice.len();
+    let Some(slice) = input.get(offset..offset.saturating_add(N)) else {
+        return Err(HeaderParseError::InvalidLengthForField {
+            field_name,
+            expected_length: N,
+            actual_length: input.len().saturating_sub(offset),
+        });
+    };
 
     let slice: [u8; N] = slice
         .try_into()
-        .map_err(|_| HeaderParseError::InvalidLenghtForField {
+        .map_err(|_| HeaderParseError::InvalidLengthForField {
             field_name,
             expected_length: N,
-            actual_length,
+            actual_length: slice.len(),
         })?;
 
     Ok(slice)
@@ -59,3 +64,31 @@ impl_read_field_numeric!(
     read_field_i32 => i32,
     read_field_i64 => i64,
 );
+
+#[cfg(test)]
+mod test {
+    use crate::parse::{HeaderParseError, read_field_slice, read_field_u32};
+
+    #[test]
+    fn short_input_is_an_error_not_a_panic() {
+        let input = [0x01u8, 0x02];
+
+        let result = read_field_slice::<4>("test.field", &input, 0);
+        assert_eq!(
+            result,
+            Err(HeaderParseError::InvalidLengthForField {
+                field_name: "test.field",
+                expected_length: 4,
+                actual_length: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn offset_past_end_is_an_error_not_a_panic() {
+        let input = [0x01u8, 0x02];
+
+        let result = read_field_u32("test.field", &input, 8);
+        assert!(result.is_err());
+    }
+}
