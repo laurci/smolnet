@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::task::{Context, Poll};
 
 use crate::{
     addr::MacAddr,
@@ -43,7 +43,11 @@ impl Device for TapDevice {
         self.inner.write_frame(data)
     }
 
-    fn wait(&mut self, timeout: Option<Duration>, wait_writable: bool) -> Result<(), DeviceError> {
-        self.inner.wait(timeout, wait_writable)
+    fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_readable(cx)
+    }
+
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_writable(cx)
     }
 }

@@ -36,9 +36,6 @@ struct TcpListener {
     backlog: VecDeque<TcpSocketHandle>,
 }
 
-/// The socket table. Owns the listeners and connections, routes inbound
-/// segments to the right one, and hands the application its handles. Everything
-/// about how a connection behaves lives in [`TcpConnection`].
 #[derive(Default)]
 pub struct TcpEngine {
     next_handle: usize,
@@ -85,6 +82,13 @@ impl TcpEngine {
         tracing::debug!(port, "tcp connection accepted");
 
         Some(handle)
+    }
+
+    pub fn can_accept(&self, listener: &TcpListenerHandle) -> bool {
+        self.listener_ports
+            .get(listener)
+            .and_then(|port| self.listeners.get(port))
+            .is_some_and(|listener| !listener.backlog.is_empty())
     }
 
     pub fn close_listener(&mut self, listener: TcpListenerHandle) {
@@ -238,6 +242,14 @@ impl TcpEngine {
 
     pub fn state(&self, handle: &TcpSocketHandle) -> Option<TcpState> {
         self.connection(handle).map(TcpConnection::state)
+    }
+
+    pub fn peer_addr(&self, handle: &TcpSocketHandle) -> Option<(Ipv4Addr, u16)> {
+        self.connection(handle).map(TcpConnection::peer)
+    }
+
+    pub fn local_port(&self, handle: &TcpSocketHandle) -> Option<u16> {
+        self.connection(handle).map(TcpConnection::local_port)
     }
 
     pub fn peer_finished(&self, handle: &TcpSocketHandle) -> bool {

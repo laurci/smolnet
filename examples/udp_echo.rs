@@ -1,11 +1,11 @@
 use std::error::Error;
-use std::time::Instant;
+use std::net::{Ipv4Addr, SocketAddr};
 
-use smolnet::{
-    device::{Device, tap::TapDevice},
-    stack::{Stack, StackIdentity},
-};
+use smolnet::{device::tap::TapDevice, stack::StackIdentity};
+use tokio::task::spawn;
 use tracing_subscriber::EnvFilter;
+
+const LISTEN_PORT: u16 = 7878;
 
 fn init_tracing() {
     tracing_subscriber::fmt()
@@ -16,30 +16,36 @@ fn init_tracing() {
         .init();
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
 
     let identity = StackIdentity {
-        ip: [10, 30, 0, 2],
-        gateway: [10, 30, 0, 1],
+        ip: Ipv4Addr::new(10, 30, 0, 2).octets(),
+        gateway: Ipv4Addr::new(10, 30, 0, 1).octets(),
         netmask: [0xff, 0xff, 0xff, 0x00],
     };
 
-    let mut device = TapDevice::open("tap0", [0x02, 0xde, 0xad, 0xbe, 0xef, 0x02])?;
+    let device = TapDevice::open("tap0", [0x02, 0xde, 0xad, 0xbe, 0xef, 0x02])?;
 
-    let mut stack = Stack::new(identity, device.capabilities());
+    let (net, driver) = smolnet::net::build(identity, device);
+    spawn(driver.run());
 
-    let sock = stack.udp_bind(7878.into())?;
+    let socket = net.udp_bind(Some(LISTEN_PORT))?;
+    tracing::info!(port = LISTEN_PORT, "listening");
+
+    let mut buf = [0u8; 1500];
 
     loop {
-        stack.poll(&mut device, Instant::now())?;
+        let (n, peer) = socket.recv_from(&mut buf).await?;
 
-        while let Some((addr, port, data)) = stack.udp_recv(&sock) {
-            let text = String::from_utf8_lossy(&data);
-            let reply = format!("reply: {}\n", text.trim());
-            stack.udp_send(&sock, addr, port, reply.into_bytes());
-        }
+        let text = String::from_utf8_lossy(&buf[..n]);
+        tracing::info!(%peer, "echoing {} bytes: {}", n, text.trim());
 
-        stack.wait(&mut device, Instant::now())?;
+        let SocketAddr::V4(peer) = peer else {
+            continue;
+        };
+
+        socket.send_to(&buf[..n], *peer.ip(), peer.port())?;
     }
 }

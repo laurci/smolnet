@@ -169,27 +169,11 @@ impl Stack {
         .min()
     }
 
-    pub fn wait<D: Device + ?Sized>(
-        &mut self,
-        device: &mut D,
-        now: Instant,
-    ) -> Result<(), StackError> {
-        if self.has_work() {
-            return Ok(());
-        }
-
-        let timeout = self
-            .poll_at()
-            .map(|deadline| deadline.saturating_duration_since(now));
-
-        let wait_writable = !self.tx.is_empty();
-
-        device
-            .wait(timeout, wait_writable)
-            .map_err(StackError::DeviceError)
+    pub fn has_pending_tx(&self) -> bool {
+        !self.tx.is_empty()
     }
 
-    fn has_work(&self) -> bool {
+    pub fn has_work(&self) -> bool {
         !self.tx.is_empty() || self.udp.has_work() || self.tcp.has_work()
     }
 
@@ -266,6 +250,24 @@ impl Stack {
 
     pub fn tcp_state(&self, handle: &TcpSocketHandle) -> Option<TcpState> {
         self.tcp.state(handle)
+    }
+
+    pub fn tcp_peer_addr(&self, handle: &TcpSocketHandle) -> Option<(Ipv4Addr, u16)> {
+        self.tcp.peer_addr(handle)
+    }
+
+    pub fn tcp_local_addr(&self, handle: &TcpSocketHandle) -> Option<(Ipv4Addr, u16)> {
+        self.tcp
+            .local_port(handle)
+            .map(|port| (self.identity.ip, port))
+    }
+
+    pub fn tcp_can_accept(&self, listener: &TcpListenerHandle) -> bool {
+        self.tcp.can_accept(listener)
+    }
+
+    pub fn udp_can_recv(&self, handle: &UdpSocketHandle) -> bool {
+        self.udp.can_recv(handle)
     }
 
     pub fn tcp_can_recv(&self, handle: &TcpSocketHandle) -> bool {

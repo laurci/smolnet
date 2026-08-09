@@ -127,6 +127,13 @@ impl UdpEngine {
         self.sockets.get_mut(&port)
     }
 
+    pub fn can_recv(&self, handle: &UdpSocketHandle) -> bool {
+        self.handle_ports
+            .get(&handle.0)
+            .and_then(|port| self.sockets.get(port))
+            .is_some_and(|socket| !socket.rx_queue.is_empty())
+    }
+
     pub fn recv(&mut self, handle: &UdpSocketHandle) -> Option<UdpDatagram> {
         self.socket_mut(handle)?.rx_queue.pop_front()
     }

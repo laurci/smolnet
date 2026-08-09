@@ -30,8 +30,6 @@ impl Congestion {
         self.cwnd = mss * TCP_INITIAL_WINDOW_SEGMENTS;
     }
 
-    /// An acknowledgement of data we had not seen acknowledged before. Only new
-    /// data opens the window: acknowledging a syn or a fin is not progress.
     pub fn on_new_ack(&mut self, acked_data: usize, mss: usize) {
         self.dup_acks = 0;
 
@@ -54,8 +52,6 @@ impl Congestion {
         }
     }
 
-    /// Returns whether this duplicate is the one that should trigger a
-    /// retransmission without waiting for the timer.
     pub fn on_duplicate_ack(&mut self, mss: usize, flight: usize) -> bool {
         self.dup_acks += 1;
 

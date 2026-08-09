@@ -84,6 +84,7 @@ fn emit(
     seq: u32,
     ack: u32,
     flags: u8,
+    window: u16,
     options: &[TcpOption<'_>],
     payload: Vec<u8>,
     tx: &mut TxQueue,
@@ -94,7 +95,7 @@ fn emit(
         seq,
         ack,
         flags,
-        window: TCP_RECV_WINDOW,
+        window,
         urgent_ptr: 0,
         options,
         payload: payload.into(),
@@ -115,6 +116,7 @@ fn emit(
         seq,
         ack,
         flags = format_args!("{flags:#010b}"),
+        window,
         payload = frame.payload().len(),
         "tcp segment sent"
     );
@@ -123,8 +125,6 @@ fn emit(
     tx.push(TxPacket::Ipv4(ipv4.into_owned()));
 }
 
-/// Answers a segment that belongs to no socket. There is no connection to hold
-/// state, so everything comes from the offending segment itself.
 pub(super) fn reset_segment(
     local_ip: Ipv4Addr,
     key: &ConnectionKey,
@@ -150,7 +150,17 @@ pub(super) fn reset_segment(
         "tcp resetting segment for a port with no socket"
     );
 
-    emit(local_ip, key, seq, ack, flags, &[], vec![], tx);
+    emit(
+        local_ip,
+        key,
+        seq,
+        ack,
+        flags,
+        TCP_RECV_WINDOW,
+        &[],
+        vec![],
+        tx,
+    );
 }
 
 pub(super) struct TcpConnection {
@@ -222,7 +232,6 @@ impl TcpConnection {
         }
     }
 
-    /// Opens a connection, putting the syn on the wire.
     pub(super) fn connect(
         local_ip: Ipv4Addr,
         handle: TcpSocketHandle,
@@ -238,6 +247,7 @@ impl TcpConnection {
             connection.iss,
             0,
             TCP_FLAG_SYN,
+            connection.advertised_window(),
             &[TcpOption::Mss(TCP_MSS_DEFAULT)],
             vec![],
             tx,
@@ -248,7 +258,6 @@ impl TcpConnection {
         connection
     }
 
-    /// Answers an inbound syn, putting the syn-ack on the wire.
     pub(super) fn accept(
         local_ip: Ipv4Addr,
         handle: TcpSocketHandle,
@@ -269,6 +278,7 @@ impl TcpConnection {
             connection.iss,
             connection.rcv_nxt,
             TCP_FLAG_SYN | TCP_FLAG_ACK,
+            connection.advertised_window(),
             &[TcpOption::Mss(TCP_MSS_DEFAULT)],
             vec![],
             tx,
@@ -285,6 +295,14 @@ impl TcpConnection {
 
     pub(super) fn state(&self) -> TcpState {
         self.state
+    }
+
+    pub(super) fn local_port(&self) -> u16 {
+        self.key.local_port
+    }
+
+    pub(super) fn peer(&self) -> (Ipv4Addr, u16) {
+        (self.key.remote_ip, self.key.remote_port)
     }
 
     pub(super) fn peer_finished(&self) -> bool {
@@ -330,6 +348,10 @@ impl TcpConnection {
 
     fn flight(&self) -> usize {
         self.snd_nxt.wrapping_sub(self.snd_una) as usize
+    }
+
+    fn advertised_window(&self) -> u16 {
+        (TCP_RECV_WINDOW as usize).saturating_sub(self.rx_buffer.len()) as u16
     }
 
     pub(super) fn on_segment(
@@ -388,6 +410,7 @@ impl TcpConnection {
                 tcp.ack(),
                 0,
                 TCP_FLAG_RST,
+                self.advertised_window(),
                 &[],
                 vec![],
                 tx,
@@ -663,6 +686,7 @@ impl TcpConnection {
                 self.snd_nxt,
                 self.rcv_nxt,
                 TCP_FLAG_RST,
+                self.advertised_window(),
                 &[],
                 vec![],
                 tx,
@@ -685,6 +709,8 @@ impl TcpConnection {
             "tcp retransmitting"
         );
 
+        let window = self.advertised_window();
+
         match self.state {
             TcpState::SynSent => emit(
                 self.local_ip,
@@ -692,6 +718,7 @@ impl TcpConnection {
                 self.iss,
                 0,
                 TCP_FLAG_SYN,
+                window,
                 &[TcpOption::Mss(TCP_MSS_DEFAULT)],
                 vec![],
                 tx,
@@ -702,6 +729,7 @@ impl TcpConnection {
                 self.iss,
                 self.rcv_nxt,
                 TCP_FLAG_SYN | TCP_FLAG_ACK,
+                window,
                 &[TcpOption::Mss(TCP_MSS_DEFAULT)],
                 vec![],
                 tx,
@@ -735,6 +763,7 @@ impl TcpConnection {
                 self.snd_nxt,
                 self.rcv_nxt,
                 TCP_FLAG_ACK,
+                self.advertised_window(),
                 &[],
                 vec![],
                 tx,
@@ -755,6 +784,7 @@ impl TcpConnection {
 
     fn send_pending_data(&mut self, now: Instant, tx: &mut TxQueue) -> bool {
         let mut sent = false;
+        let advertised = self.advertised_window();
 
         loop {
             let offset = self.flight();
@@ -762,8 +792,8 @@ impl TcpConnection {
                 break;
             }
 
-            let window = (self.snd_wnd as usize).min(self.congestion.window());
-            let allowed = window.saturating_sub(offset);
+            let send_window = (self.snd_wnd as usize).min(self.congestion.window());
+            let allowed = send_window.saturating_sub(offset);
             let available = self.send_buffer.len() - offset;
             let len = available.min(self.snd_mss as usize).min(allowed);
 
@@ -771,8 +801,6 @@ impl TcpConnection {
                 break;
             }
 
-            // a partial segment is only worth sending when it is all that is left,
-            // otherwise we would be spending a packet on a sliver of window
             if len < self.snd_mss as usize && len < available {
                 break;
             }
@@ -791,6 +819,7 @@ impl TcpConnection {
                 self.snd_nxt,
                 self.rcv_nxt,
                 TCP_FLAG_PSH | TCP_FLAG_ACK,
+                advertised,
                 &[],
                 payload,
                 tx,
@@ -819,6 +848,7 @@ impl TcpConnection {
             fin_seq,
             self.rcv_nxt,
             TCP_FLAG_FIN | TCP_FLAG_ACK,
+            self.advertised_window(),
             &[],
             vec![],
             tx,
@@ -858,9 +888,22 @@ impl TcpConnection {
     }
 
     pub(super) fn recv(&mut self, buf: &mut [u8]) -> usize {
+        let before = self.advertised_window();
+
         let len = buf.len().min(self.rx_buffer.len());
         for (slot, byte) in buf.iter_mut().zip(self.rx_buffer.drain(..len)) {
             *slot = byte;
+        }
+
+        let after = self.advertised_window();
+        if before < self.snd_mss && after >= self.snd_mss {
+            tracing::debug!(
+                local_port = self.key.local_port,
+                window = after,
+                "tcp window reopened"
+            );
+
+            self.needs_ack = true;
         }
 
         len

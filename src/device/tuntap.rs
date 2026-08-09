@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::time::Duration;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::task::{Context, Poll, ready};
 
 use nix::fcntl::{OFlag, open};
 use nix::libc;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::stat::Mode;
 use thiserror::Error;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 use crate::device::{DeviceCapabilities, DeviceError};
 
@@ -33,10 +34,13 @@ pub enum TunTapOpenError {
 
     #[error("failed to open tun/tap device:\n{0}")]
     Io(nix::Error),
+
+    #[error("failed to register the tun/tap device with the reactor:\n{0}")]
+    Reactor(std::io::Error),
 }
 
 pub struct TunTapDevice {
-    file: File,
+    file: AsyncFd<File>,
     capabilities: DeviceCapabilities,
 }
 
@@ -70,10 +74,10 @@ impl TunTapDevice {
             tun_set_iff(fd.as_raw_fd(), &ifr as *const IfReq as u64).map_err(TunTapOpenError::Io)?
         };
 
-        Ok(TunTapDevice {
-            file: fd.into(),
-            capabilities,
-        })
+        let file = AsyncFd::with_interest(File::from(fd), Interest::READABLE | Interest::WRITABLE)
+            .map_err(TunTapOpenError::Reactor)?;
+
+        Ok(TunTapDevice { file, capabilities })
     }
 
     pub fn capabilities(&self) -> DeviceCapabilities {
@@ -82,7 +86,7 @@ impl TunTapDevice {
 
     pub fn read_frame(&mut self, data: &mut [u8]) -> Result<usize, DeviceError> {
         loop {
-            match self.file.read(data) {
+            match self.file.get_mut().read(data) {
                 Ok(n) => {
                     tracing::trace!(len = n, "read frame from tun/tap");
                     return Ok(n);
@@ -98,7 +102,7 @@ impl TunTapDevice {
 
     pub fn write_frame(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         loop {
-            match self.file.write(data) {
+            match self.file.get_mut().write(data) {
                 Ok(n) => {
                     debug_assert_eq!(n, data.len(), "tun/tap wrote partial frame");
                     tracing::trace!(len = n, "wrote frame to tun/tap");
@@ -114,28 +118,17 @@ impl TunTapDevice {
         }
     }
 
-    pub fn wait(
-        &mut self,
-        timeout: Option<Duration>,
-        wait_writable: bool,
-    ) -> Result<(), DeviceError> {
-        let mut events = PollFlags::POLLIN;
-        if wait_writable {
-            events |= PollFlags::POLLOUT;
-        }
+    pub fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut guard = ready!(self.file.poll_read_ready_mut(cx))?;
+        guard.clear_ready();
 
-        let timeout = match timeout {
-            None => PollTimeout::NONE,
-            Some(d) => {
-                let ms = d.as_millis().max(1);
-                PollTimeout::try_from(ms).unwrap_or(PollTimeout::MAX)
-            }
-        };
+        Poll::Ready(Ok(()))
+    }
 
-        let mut fds = [PollFd::new(self.file.as_fd(), events)];
-        match poll(&mut fds, timeout) {
-            Ok(_) | Err(nix::errno::Errno::EINTR) => Ok(()),
-            Err(e) => Err(DeviceError::Io(Box::new(e))),
-        }
+    pub fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut guard = ready!(self.file.poll_write_ready_mut(cx))?;
+        guard.clear_ready();
+
+        Poll::Ready(Ok(()))
     }
 }

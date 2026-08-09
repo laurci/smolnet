@@ -4,7 +4,8 @@ pub mod tun;
 
 mod tuntap;
 
-use std::time::Duration;
+use std::io;
+use std::task::{Context, Poll};
 
 use net_header::NetHeader;
 use thiserror::Error;
@@ -59,7 +60,7 @@ impl DeviceCapabilities {
 #[derive(Debug, Error)]
 pub enum DeviceError {
     #[error("device io:\n{0}")]
-    Io(Box<dyn std::error::Error>),
+    Io(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("device read would block caller")]
     WouldBlock,
@@ -73,5 +74,7 @@ pub trait Device {
 
     fn read_frame(&mut self, data: &mut [u8]) -> Result<usize, DeviceError>;
     fn write_frame(&mut self, data: &[u8]) -> Result<(), DeviceError>;
-    fn wait(&mut self, timeout: Option<Duration>, wait_writable: bool) -> Result<(), DeviceError>;
+
+    fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
