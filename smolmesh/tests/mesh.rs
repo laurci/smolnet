@@ -30,6 +30,7 @@ struct Node {
     id: NodeId,
     ip: Ipv4Addr,
     endpoint: SocketAddr,
+    key: smolmesh::keys::PublicKey,
 }
 
 async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
@@ -44,7 +45,12 @@ async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
 
         let membership = Membership::new(network, id, ip);
 
-        let (device, handle) = MeshDevice::bind("127.0.0.1:0", &membership).await.unwrap();
+        let keys = smolmesh::keys::Keypair::generate().unwrap();
+        let key = keys.public();
+
+        let (device, handle) = MeshDevice::bind("127.0.0.1:0", &membership, keys)
+            .await
+            .unwrap();
         let endpoint = handle.local_addr().unwrap();
 
         let (net, driver) = smolnet::net::build(membership.stack_identity(), device);
@@ -56,12 +62,19 @@ async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
             id,
             ip,
             endpoint,
+            key,
         });
     }
 
+    // The control plane is what distributes static keys in production; here the
+    // roster carries them so a session can be established.
     let roster: Vec<Peer> = nodes
         .iter()
-        .map(|node| Peer::new(node.id, node.ip).with_endpoint(node.endpoint))
+        .map(|node| {
+            let mut peer = Peer::new(node.id, node.ip).with_endpoint(node.endpoint);
+            peer.key = Some(node.key);
+            peer
+        })
         .collect();
 
     for node in &nodes {
@@ -109,7 +122,12 @@ async fn send_datagram(
     packet: &[u8],
 ) {
     let datagram =
-        smolmesh::wire::Datagram::new(smolmesh::wire::MessageType::Data, network, sender, packet);
+        smolmesh::wire::Datagram::new(
+            smolmesh::wire::MessageType::Keepalive,
+            network,
+            sender,
+            packet,
+        );
 
     let mut bytes = vec![0u8; datagram.size()];
     datagram.write(&mut bytes);
@@ -246,7 +264,7 @@ async fn a_peer_cannot_spoof_another_peers_address() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_known_peer_is_delivered() {
+async fn plaintext_is_refused_even_from_a_known_peer() {
     let (network, nodes) = mesh(2).await;
 
     let socket = nodes[0].net.udp_bind(Some(ECHO_PORT)).unwrap();
@@ -254,55 +272,44 @@ async fn a_known_peer_is_delivered() {
     let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let packet = udp_packet(nodes[1].ip, nodes[0].ip, ECHO_PORT, b"hello neighbour");
 
+    // Exactly what used to be delivered: a well formed datagram naming a peer
+    // the receiver knows. There is no plaintext path any more, so it is dropped.
     send_datagram(&outsider, nodes[0].endpoint, network, nodes[1].id, &packet).await;
 
     let mut buf = [0u8; 128];
-    let (len, from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-        .await
-        .expect("the datagram arrived")
-        .unwrap();
 
-    assert_eq!(&buf[..len], b"hello neighbour");
-    assert_eq!(from.ip(), std::net::IpAddr::V4(nodes[1].ip));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "unencrypted traffic must never reach the stack"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_endpoint_is_learned_from_inbound_traffic() {
-    let (_, nodes) = mesh(2).await;
+async fn two_nodes_reach_each_other_over_an_encrypted_session() {
+    let (_network, nodes) = mesh(2).await;
 
-    let peers = nodes[0].handle.peers();
-    peers.insert(Peer::new(nodes[1].id, nodes[1].ip));
+    let listener = nodes[0].net.udp_bind(Some(ECHO_PORT)).unwrap();
+    let sender = nodes[1].net.udp_bind(None).unwrap();
 
-    assert_eq!(
-        peers.route(&nodes[1].ip),
-        None,
-        "the first node has forgotten how to reach the second"
-    );
+    let mut buf = [0u8; 128];
 
-    spawn_echo(&nodes[0].net, ECHO_PORT);
-
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        nodes[1].net.tcp_connect(nodes[0].ip, ECHO_PORT),
-    )
-    .await
-    .expect("the handshake completed")
-    .unwrap();
-
-    stream.write_all(b"punched").await.unwrap();
-
-    let mut buf = [0u8; 7];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
-        .await
-        .expect("the echo came back")
+    // The first packet triggers the handshake and is held, not lost, so a
+    // single send is enough once the session comes up.
+    sender
+        .send_to(b"sealed and delivered", nodes[0].ip, ECHO_PORT)
         .unwrap();
 
-    assert_eq!(
-        peers.route(&nodes[1].ip),
-        Some(nodes[1].endpoint),
-        "the endpoint was learned from the incoming handshake"
-    );
+    let (len, from) = tokio::time::timeout(Duration::from_secs(10), listener.recv_from(&mut buf))
+        .await
+        .expect("the encrypted datagram arrived")
+        .unwrap();
+
+    assert_eq!(&buf[..len], b"sealed and delivered");
+    assert_eq!(from.ip(), std::net::IpAddr::V4(nodes[1].ip));
 }
+
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keepalive_teaches_an_endpoint_without_carrying_traffic() {

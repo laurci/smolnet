@@ -30,7 +30,12 @@ async fn join(network: NetworkId, ip: Ipv4Addr) -> Result<Node, Box<dyn Error>> 
     let id = NodeId::random();
     let membership = Membership::new(network, id, ip);
 
-    let (device, handle) = MeshDevice::bind("127.0.0.1:0", &membership).await?;
+    let (device, handle) = MeshDevice::bind(
+        "127.0.0.1:0",
+        &membership,
+        smolmesh::keys::Keypair::generate()?,
+    )
+    .await?;
     let endpoint = handle.local_addr()?;
 
     let (net, driver) = smolnet::net::build(membership.stack_identity(), device);

@@ -349,3 +349,99 @@ async fn a_device_keeps_its_address_when_it_reconnects_as_a_new_node() {
     assert_eq!(listed[0].os.as_deref(), Some(std::env::consts::OS));
     assert!(listed[0].version.is_some(), "and so was the running version");
 }
+
+#[tokio::test]
+async fn a_node_rides_out_a_control_server_restart() {
+    use smolctl::server::store::Store;
+    use std::net::SocketAddr;
+
+    init_tracing();
+
+    let store = Store::memory().await.unwrap();
+    let owner = store
+        .upsert_user("subject", "someone@example.com", None)
+        .await
+        .unwrap()
+        .id;
+
+    let network = store.default_network(&owner).await.unwrap();
+    let id: NetworkId = network.id.parse().unwrap_or_else(|_| NetworkId::random());
+
+    let device = store
+        .resolve_device(
+            &owner,
+            &network.id,
+            smolctl::server::store::Wanted::Named("rider"),
+            "unset",
+        )
+        .await
+        .unwrap();
+
+    let reflector = Reflector::bind("127.0.0.1:0").await.unwrap();
+    let advertise = reflector.local_addr().unwrap().to_string();
+    tokio::spawn(reflector.run());
+
+    // a fixed port so the "restarted" server comes back where the client expects
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address: SocketAddr = listener.local_addr().unwrap();
+    let url = format!("http://{address}");
+
+    let serve = |listener: TcpListener, store: Store, advertise: String| {
+        let service = ControlService::new(
+            Registry::new(DEFAULT_SUBNET, DEFAULT_NETMASK),
+            SECRET.to_vec(),
+            advertise,
+        )
+        .with_store(store);
+
+        tokio::spawn(
+            Server::builder()
+                .add_service(service.into_server())
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        )
+    };
+
+    let first = serve(listener, store.clone(), advertise.clone());
+
+    let token = token::mint(
+        SECRET,
+        Identity {
+            network: id,
+            node: NodeId::random(),
+            device: device.id.clone(),
+        },
+        DEFAULT_TTL,
+    )
+    .unwrap()
+    .0;
+
+    let joined = smolctl::Joined::join(JoinConfig::new(url.clone(), token))
+        .await
+        .unwrap();
+
+    let address_before = joined.membership.ip;
+    let running = tokio::spawn(joined.control.run());
+
+    // take the server away and put it back on the same port
+    first.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let again = TcpListener::bind(address).await.unwrap();
+    let _second = serve(again, store.clone(), advertise);
+
+    // the client backs off at least a second before its first retry
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        !running.is_finished(),
+        "the node must keep running across a control server restart, not exit"
+    );
+
+    assert_eq!(
+        store.device(&device.id).await.unwrap().ip,
+        address_before,
+        "and it comes back on the same address"
+    );
+
+    running.abort();
+}

@@ -9,11 +9,13 @@ pub struct Peer {
     pub node: NodeId,
     pub ip: Ipv4Addr,
     pub endpoint: Option<SocketAddr>,
+    pub key: Option<crate::keys::PublicKey>,
 }
 
 impl Peer {
     pub fn new(node: NodeId, ip: Ipv4Addr) -> Peer {
         Peer {
+            key: None,
             node,
             ip,
             endpoint: None,
@@ -86,6 +88,34 @@ impl Peers {
 
     pub fn remove(&self, node: &NodeId) -> Option<Peer> {
         self.table.lock().unwrap().remove(node)
+    }
+
+    pub fn for_ip(&self, ip: &Ipv4Addr) -> Option<Peer> {
+        let table = self.table.lock().unwrap();
+        let node = table.by_ip.get(ip)?;
+
+        table.by_node.get(node).cloned()
+    }
+
+    /// Peers we can both reach and encrypt to: an endpoint and a published key.
+    pub fn reachable(&self) -> Vec<(SocketAddr, crate::keys::PublicKey)> {
+        let table = self.table.lock().unwrap();
+
+        table
+            .by_node
+            .values()
+            .filter_map(|peer| Some((peer.endpoint?, peer.key?)))
+            .collect()
+    }
+
+    pub fn by_key(&self, key: &crate::keys::PublicKey) -> Option<Peer> {
+        let table = self.table.lock().unwrap();
+
+        table
+            .by_node
+            .values()
+            .find(|peer| peer.key.as_ref() == Some(key))
+            .cloned()
     }
 
     pub fn get(&self, node: &NodeId) -> Option<Peer> {

@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 rand = "0.10.2"
+snow = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 smolnet = { path = "../smolnet" }
 thiserror = "2.0.20"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }

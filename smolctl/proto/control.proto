@@ -24,6 +24,8 @@ message Hello {
   string hostname = 1;
   string os = 2;
   string version = 3;
+  // hex encoded x25519 static public key for the noise session
+  string public_key = 4;
 }
 
 message ServerMessage {
@@ -50,6 +52,7 @@ message PeerState {
   string ip = 2;
   repeated string endpoints = 3;
   bool online = 4;
+  string public_key = 5;
 }
 
 message PeerGone {

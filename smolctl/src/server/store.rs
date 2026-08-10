@@ -70,6 +70,7 @@ pub struct Device {
     pub version: Option<String>,
     pub last_seen: Option<i64>,
     pub online: bool,
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,7 +434,7 @@ impl Store {
     async fn read_device(&self, id: &str) -> Result<Device, StoreError> {
         let row = sqlx::query(
             "SELECT id, owner, network, COALESCE(node, ''), ip, hostname, os, version,
-                    last_seen, online, name, ephemeral
+                    last_seen, online, name, ephemeral, public_key
              FROM devices WHERE id = ?1",
         )
         .bind(id)
@@ -456,6 +457,7 @@ impl Store {
             online: row.get::<i64, _>(9) != 0,
             name: row.get(10),
             ephemeral: row.get::<i64, _>(11) != 0,
+            public_key: row.get(12),
         })
     }
 
@@ -465,18 +467,21 @@ impl Store {
         hostname: Option<&str>,
         os: Option<&str>,
         version: Option<&str>,
+        public_key: Option<&str>,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE devices
              SET hostname = COALESCE(?2, hostname),
                  os = COALESCE(?3, os),
-                 version = COALESCE(?4, version)
+                 version = COALESCE(?4, version),
+                 public_key = COALESCE(?5, public_key)
              WHERE id = ?1",
         )
         .bind(id)
         .bind(hostname)
         .bind(os)
         .bind(version)
+        .bind(public_key)
         .execute(&self.pool)
         .await?;
 
@@ -1197,7 +1202,7 @@ mod test {
             .unwrap();
 
         store
-            .describe(&device.id, Some("laptop"), Some("macos"), Some("0.1.0"))
+            .describe(&device.id, Some("laptop"), Some("macos"), Some("0.1.0"), None)
             .await
             .unwrap();
         store.mark(&device.id, true).await.unwrap();
@@ -1208,7 +1213,7 @@ mod test {
         assert_eq!(listed[0].version.as_deref(), Some("0.1.0"));
         assert!(listed[0].online);
 
-        store.describe(&device.id, None, None, Some("0.2.0")).await.unwrap();
+        store.describe(&device.id, None, None, Some("0.2.0"), None).await.unwrap();
         let listed = store.devices(&owner).await.unwrap();
 
         assert_eq!(listed[0].hostname.as_deref(), Some("laptop"), "partial updates keep the rest");

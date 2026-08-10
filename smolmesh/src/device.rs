@@ -11,7 +11,9 @@ use tokio::sync::watch;
 use crate::{
     id::{NetworkId, NodeId},
     membership::Membership,
+    keys::Keypair,
     peer::{Peer, Peers},
+    session::Sessions,
     stun,
     wire::{
         Datagram, DatagramParseError, ENDPOINT_SIZE, HEADER_SIZE, MessageType, as_ipv4_endpoint,
@@ -20,6 +22,10 @@ use crate::{
 };
 
 pub const MESH_MTU: usize = 1280;
+
+/// Enough to cover a handshake round trip without letting a silent peer soak up
+/// memory.
+const QUEUE_DEPTH: usize = 16;
 
 pub const MESH_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
@@ -69,6 +75,21 @@ fn ipv4_destination(packet: &[u8]) -> Option<Ipv4Addr> {
 
 #[derive(Debug, Error)]
 enum Discard {
+    #[error("no session holds index {0}")]
+    NoSession(u32),
+
+    #[error("the session belongs to a peer we no longer know")]
+    Unrecognised,
+
+    #[error("the packet did not decrypt: {0}")]
+    Undecryptable(String),
+
+    #[error("the peer refused or produced no handshake")]
+    HandshakeRefused,
+
+    #[error("peer {0} has published no public key yet")]
+    NoKey(NodeId),
+
     #[error("malformed datagram:\n{0}")]
     Malformed(DatagramParseError),
 
@@ -93,13 +114,15 @@ enum Discard {
         expected: Ipv4Addr,
     },
 
-    #[error("payload of {payload} bytes exceeds the receive buffer ({buffer})")]
-    Oversized { payload: usize, buffer: usize },
 }
 
 enum Handled {
     Frame(usize),
     Probe(SocketAddr),
+    /// A handshake message that must be answered to the endpoint it came from.
+    Answer(SocketAddr, Vec<u8>),
+    /// A session just came up, so anything held for it can go now.
+    Ready(crate::keys::PublicKey, SocketAddr),
     Nothing,
 }
 
@@ -127,6 +150,10 @@ pub struct MeshDevice {
     broadcast: Ipv4Addr,
 
     peers: Peers,
+    sessions: Sessions,
+    /// Packets that arrived before a session existed. Held briefly so the first
+    /// packet to a peer is not simply lost while the handshake completes.
+    waiting: std::collections::HashMap<crate::keys::PublicKey, Vec<Vec<u8>>>,
     observed: Arc<watch::Sender<Observed>>,
     transaction: stun::Transaction,
 
@@ -140,6 +167,7 @@ impl MeshDevice {
     pub async fn bind(
         addr: impl ToSocketAddrs,
         membership: &Membership,
+        keys: Keypair,
     ) -> io::Result<(MeshDevice, MeshHandle)> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
 
@@ -160,6 +188,8 @@ impl MeshDevice {
         );
 
         let device = MeshDevice {
+            sessions: Sessions::new(keys.clone()),
+            waiting: std::collections::HashMap::new(),
             socket: socket.clone(),
             network: membership.network,
             node: membership.node,
@@ -239,7 +269,42 @@ impl MeshDevice {
         Ok(peer)
     }
 
-    fn accept(&self, size: usize, from: SocketAddr, out: &mut [u8]) -> Result<Handled, Discard> {
+    fn accept(&mut self, size: usize, from: SocketAddr, out: &mut [u8]) -> Result<Handled, Discard> {
+        // Encrypted data carries no node id, so it is recognised by its own
+        // compact header before the plaintext control forms are parsed.
+        if let Some(sealed) = crate::wire::Sealed::parse(&self.rx[..size]) {
+            let Some(session) = self.sessions.by_index(sealed.index) else {
+                return Err(Discard::NoSession(sealed.index));
+            };
+
+            let peer_key = session.peer();
+
+            let len = session
+                .open(sealed.counter, sealed.ciphertext, out)
+                .map_err(|e| Discard::Undecryptable(format!("{e}")))?;
+
+            let Some(peer) = self.peers.by_key(&peer_key) else {
+                return Err(Discard::Unrecognised);
+            };
+
+            if self.peers.learn_endpoint(&peer.node, from) {
+                tracing::info!(ip = %peer.ip, endpoint = %from, "peer endpoint learned");
+            }
+
+            let Some(source) = ipv4_source(&out[..len]) else {
+                return Err(Discard::NotIpv4);
+            };
+
+            if source != peer.ip {
+                return Err(Discard::SpoofedSource {
+                    claimed: source,
+                    expected: peer.ip,
+                });
+            }
+
+            return Ok(Handled::Frame(len));
+        }
+
         let datagram = Datagram::parse(&self.rx[..size]).map_err(Discard::Malformed)?;
 
         if datagram.network != self.network {
@@ -269,32 +334,63 @@ impl MeshDevice {
 
                 Ok(Handled::Nothing)
             }
-            MessageType::Data => {
-                let peer = self.member(&datagram.sender, from)?;
-
-                let Some(source) = ipv4_source(datagram.payload) else {
-                    return Err(Discard::NotIpv4);
+            MessageType::HandshakeInit => {
+                // [..4] is the initiator's index, the rest is noise message one
+                let Some((index, rest)) = datagram.payload.split_at_checked(4) else {
+                    return Err(Discard::MalformedReflection);
                 };
 
-                if source != peer.ip {
-                    return Err(Discard::SpoofedSource {
-                        claimed: source,
-                        expected: peer.ip,
-                    });
+                let remote = u32::from_be_bytes(index.try_into().unwrap_or_default());
+
+                let Some((ours, reply)) = self.sessions.on_initiation(rest, remote) else {
+                    return Err(Discard::HandshakeRefused);
+                };
+
+                self.member(&datagram.sender, from).ok();
+
+                let mut framed = Vec::with_capacity(8 + reply.len());
+                framed.extend_from_slice(&remote.to_be_bytes());
+                framed.extend_from_slice(&ours.to_be_bytes());
+                framed.extend_from_slice(&reply);
+
+                tracing::info!(peer = %datagram.sender, "answered a handshake");
+
+                if let Some(peer) = self.peers.get(&datagram.sender)
+                    && let Some(key) = peer.key
+                    && let Some(held) = self.waiting.remove(&key)
+                {
+                    tracing::debug!(
+                        held = held.len(),
+                        "dropping packets held for a peer that called first"
+                    );
                 }
 
-                if datagram.payload.len() > out.len() {
-                    return Err(Discard::Oversized {
-                        payload: datagram.payload.len(),
-                        buffer: out.len(),
-                    });
-                }
-
-                out[..datagram.payload.len()].copy_from_slice(datagram.payload);
-
-                Ok(Handled::Frame(datagram.payload.len()))
+                Ok(Handled::Answer(from, framed))
             }
-        }
+            MessageType::HandshakeReply => {
+                let Some((indices, rest)) = datagram.payload.split_at_checked(8) else {
+                    return Err(Discard::MalformedReflection);
+                };
+
+                let remote = u32::from_be_bytes(indices[4..8].try_into().unwrap_or_default());
+
+                let Some(peer) = self.peers.get(&datagram.sender) else {
+                    return Err(Discard::UnknownPeer(datagram.sender));
+                };
+
+                let Some(key) = peer.key else {
+                    return Err(Discard::NoKey(datagram.sender));
+                };
+
+                if !self.sessions.on_reply(key, rest, remote) {
+                    return Err(Discard::HandshakeRefused);
+                }
+
+                tracing::info!(peer = %datagram.sender, ip = %peer.ip, "session established");
+
+                Ok(Handled::Ready(key, from))
+            }
+}
     }
 
     fn reply_to_probe(&mut self, from: SocketAddr) {
@@ -318,17 +414,89 @@ impl MeshDevice {
         }
     }
 
-    fn send_to(&mut self, packet: &[u8], endpoint: SocketAddr) -> Result<(), DeviceError> {
-        let datagram = Datagram::new(MessageType::Data, self.network, self.node, packet);
+    /// Send anything that was waiting on this session being established.
+    fn flush_waiting(&mut self, key: crate::keys::PublicKey, endpoint: SocketAddr) {
+        let Some(queued) = self.waiting.remove(&key) else {
+            return;
+        };
+
+        tracing::debug!(held = queued.len(), "flushing packets held for the handshake");
+
+        for packet in queued {
+            if let Err(e) = self.send_to(&packet, endpoint, key) {
+                tracing::debug!("could not send a held packet: {e}");
+            }
+        }
+    }
+
+    /// Ask a peer for a session. Data cannot flow until it answers, so the
+    /// packet that triggered this is dropped rather than sent in the clear.
+    fn start_handshake(&mut self, key: crate::keys::PublicKey, endpoint: SocketAddr) {
+        let Some((index, message)) = self.sessions.begin(key) else {
+            return;
+        };
+
+        let mut payload = Vec::with_capacity(4 + message.len());
+        payload.extend_from_slice(&index.to_be_bytes());
+        payload.extend_from_slice(&message);
+
+        let datagram = Datagram::new(
+            MessageType::HandshakeInit,
+            self.network,
+            self.node,
+            &payload,
+        );
 
         if datagram.size() > self.tx.len() {
+            return;
+        }
+
+        let size = datagram.write(&mut self.tx);
+
+        match self.socket.try_send_to(&self.tx[..size], endpoint) {
+            Ok(_) => tracing::info!(%endpoint, "asked a peer for a session"),
+            Err(e) => tracing::debug!(%endpoint, "could not start a handshake: {e}"),
+        }
+    }
+
+    /// Encrypt and send. There is no plaintext path: without a session the
+    /// packet is dropped and a handshake is started instead.
+    fn send_to(
+        &mut self,
+        packet: &[u8],
+        endpoint: SocketAddr,
+        key: crate::keys::PublicKey,
+    ) -> Result<(), DeviceError> {
+        let header = crate::wire::DATA_HEADER_SIZE;
+
+        if header + packet.len() + crate::session::TAG_SIZE > self.tx.len() {
             return Err(DeviceError::BufferTooSmall {
-                need: datagram.size(),
+                need: header + packet.len() + crate::session::TAG_SIZE,
                 got: self.tx.len(),
             });
         }
 
-        let size = datagram.write(&mut self.tx);
+        let Some(session) = self.sessions.established(&key) else {
+            let queue = self.waiting.entry(key).or_default();
+
+            if queue.len() < QUEUE_DEPTH {
+                queue.push(packet.to_vec());
+            }
+
+            self.start_handshake(key, endpoint);
+
+            return Ok(());
+        };
+
+        let index = session.remote_index();
+
+        let (counter, written) = session
+            .seal(packet, &mut self.tx[header..])
+            .map_err(|e| DeviceError::Io(Box::new(io::Error::other(e.to_string()))))?;
+
+        crate::wire::Sealed::write_header(index, counter, &mut self.tx);
+
+        let size = header + written;
 
         match self.socket.try_send_to(&self.tx[..size], endpoint) {
             Ok(_) => {
@@ -341,8 +509,8 @@ impl MeshDevice {
     }
 
     fn flood(&mut self, packet: &[u8]) -> Result<(), DeviceError> {
-        for endpoint in self.peers.endpoints() {
-            if let Err(e) = self.send_to(packet, endpoint) {
+        for (endpoint, key) in self.peers.reachable() {
+            if let Err(e) = self.send_to(packet, endpoint, key) {
                 tracing::debug!(%endpoint, "dropping broadcast for peer: {e}");
             }
         }
@@ -381,6 +549,28 @@ impl Device for MeshDevice {
                     return Ok(len);
                 }
                 Ok(Handled::Probe(from)) => self.reply_to_probe(from),
+                Ok(Handled::Answer(to, payload)) => {
+                    let datagram = Datagram::new(
+                        MessageType::HandshakeReply,
+                        self.network,
+                        self.node,
+                        &payload,
+                    );
+
+                    if datagram.size() <= self.tx.len() {
+                        let size = datagram.write(&mut self.tx);
+
+                        if let Err(e) = self.socket.try_send_to(&self.tx[..size], to) {
+                            tracing::debug!(%to, "could not answer a handshake: {e}");
+                        }
+                    }
+
+                    continue;
+                }
+                Ok(Handled::Ready(key, endpoint)) => {
+                    self.flush_waiting(key, endpoint);
+                    continue;
+                }
                 Ok(Handled::Nothing) => continue,
                 Err(reason) => {
                     tracing::debug!(%from, "discarding datagram: {reason}");
@@ -403,12 +593,19 @@ impl Device for MeshDevice {
             return self.flood(data);
         }
 
-        let Some(endpoint) = self.peers.route(&destination) else {
+        let Some(peer) = self.peers.for_ip(&destination) else {
             tracing::debug!(%destination, "dropping frame for an unreachable destination");
             return Ok(());
         };
 
-        self.send_to(data, endpoint)
+        let (Some(endpoint), Some(key)) = (peer.endpoint, peer.key) else {
+            // Fail closed: with no endpoint or no published key there is no way
+            // to send this without putting it on the wire in the clear.
+            tracing::debug!(%destination, "dropping frame, no encrypted path to that peer yet");
+            return Ok(());
+        };
+
+        self.send_to(data, endpoint, key)
     }
 
     fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

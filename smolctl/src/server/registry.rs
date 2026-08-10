@@ -24,6 +24,7 @@ pub enum RegistryError {
 pub struct Member {
     pub node: NodeId,
     pub ip: Ipv4Addr,
+    pub public_key: Option<String>,
     pub endpoints: Vec<SocketAddr>,
     pub online: bool,
 }
@@ -31,6 +32,7 @@ pub struct Member {
 impl Member {
     fn to_state(&self) -> PeerState {
         PeerState {
+            public_key: self.public_key.clone().unwrap_or_default(),
             node: self.node.to_string(),
             ip: self.ip.to_string(),
             endpoints: self.endpoints.iter().map(SocketAddr::to_string).collect(),
@@ -97,6 +99,7 @@ impl Registry {
         network: NetworkId,
         node: NodeId,
         leased: Option<Ipv4Addr>,
+        public_key: Option<String>,
         capacity: usize,
     ) -> Result<Joined, RegistryError> {
         let mut networks = self.networks.lock().unwrap();
@@ -116,12 +119,17 @@ impl Registry {
         let member = entry.members.entry(node).or_insert_with(|| Member {
             node,
             ip,
+            public_key: None,
             endpoints: vec![],
             online: false,
         });
 
         member.ip = ip;
         member.online = true;
+
+        if public_key.is_some() {
+            member.public_key = public_key;
+        }
         let state = member.to_state();
 
         let peers: Vec<PeerState> = entry
@@ -176,6 +184,68 @@ impl Registry {
         broadcast(entry, node, server_message::Body::Peer(state));
     }
 
+    /// A device that reconnects arrives as a brand new mesh node while keeping
+    /// its leased address. Without dropping the node it used last time, the
+    /// roster accumulates dead entries all claiming one address, and peers
+    /// churn through "reassigned" warnings picking between them.
+    pub fn evict_stale_nodes(&self, network: NetworkId, keep: NodeId, ip: Ipv4Addr) -> usize {
+        let mut networks = self.networks.lock().unwrap();
+
+        let Some(entry) = networks.get_mut(&network) else {
+            return 0;
+        };
+
+        let stale: Vec<NodeId> = entry
+            .members
+            .iter()
+            .filter(|(node, member)| **node != keep && member.ip == ip)
+            .map(|(node, _)| *node)
+            .collect();
+
+        for node in &stale {
+            entry.members.remove(node);
+            entry.streams.remove(node);
+
+            tracing::info!(%network, %ip, ?node, "dropping the node this device used last time");
+
+            broadcast(
+                entry,
+                keep,
+                server_message::Body::Gone(PeerGone {
+                    node: node.to_string(),
+                }),
+            );
+        }
+
+        stale.len()
+    }
+
+    /// A device publishes its static key in the hello that follows the stream
+    /// opening, so the key we read from the store at join time is the previous
+    /// run's. Peers must be told the live one or they encrypt to a dead key.
+    pub fn set_key(&self, network: NetworkId, node: NodeId, key: String) -> bool {
+        let mut networks = self.networks.lock().unwrap();
+
+        let Some(entry) = networks.get_mut(&network) else {
+            return false;
+        };
+
+        let Some(member) = entry.members.get_mut(&node) else {
+            return false;
+        };
+
+        if member.public_key.as_deref() == Some(key.as_str()) {
+            return false;
+        }
+
+        member.public_key = Some(key);
+        let state = member.to_state();
+
+        broadcast(entry, node, server_message::Body::Peer(state));
+
+        true
+    }
+
     pub fn leave(&self, network: NetworkId, node: NodeId) {
         let mut networks = self.networks.lock().unwrap();
 
@@ -225,6 +295,58 @@ fn broadcast(network: &mut Network, origin: NodeId, body: server_message::Body) 
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn a_returning_device_drops_the_node_it_used_last_time() {
+        use crate::server::registry::{DEFAULT_NETMASK, DEFAULT_SUBNET, Registry};
+        use smolmesh::{NetworkId, NodeId};
+        use std::net::Ipv4Addr;
+
+        let registry = Registry::new(DEFAULT_SUBNET, DEFAULT_NETMASK);
+        let network = NetworkId::random();
+        let leased = Ipv4Addr::new(10, 77, 0, 5);
+
+        let first = NodeId::random();
+        let second = NodeId::random();
+
+        registry.join(network, first, Some(leased), None, 8).unwrap();
+        registry.join(network, second, Some(leased), None, 8).unwrap();
+
+        let dropped = registry.evict_stale_nodes(network, second, leased);
+
+        assert_eq!(dropped, 1, "the earlier node is dropped");
+        assert_eq!(
+            registry.evict_stale_nodes(network, second, leased),
+            0,
+            "and dropping again is a no op"
+        );
+    }
+
+    #[test]
+    fn eviction_leaves_other_devices_alone() {
+        use crate::server::registry::{DEFAULT_NETMASK, DEFAULT_SUBNET, Registry};
+        use smolmesh::{NetworkId, NodeId};
+        use std::net::Ipv4Addr;
+
+        let registry = Registry::new(DEFAULT_SUBNET, DEFAULT_NETMASK);
+        let network = NetworkId::random();
+
+        let mine = NodeId::random();
+        let theirs = NodeId::random();
+
+        registry
+            .join(network, mine, Some(Ipv4Addr::new(10, 77, 0, 5)), None, 8)
+            .unwrap();
+        registry
+            .join(network, theirs, Some(Ipv4Addr::new(10, 77, 0, 6)), None, 8)
+            .unwrap();
+
+        assert_eq!(
+            registry.evict_stale_nodes(network, mine, Ipv4Addr::new(10, 77, 0, 5)),
+            0,
+            "a different address is never touched"
+        );
+    }
+
     use std::net::Ipv4Addr;
 
     use smolmesh::{NetworkId, NodeId};
@@ -243,8 +365,8 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let first = registry.join(network, NodeId::random(), None, 8).unwrap();
-        let second = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let first = registry.join(network, NodeId::random(), None, None, 8).unwrap();
+        let second = registry.join(network, NodeId::random(), None, None, 8).unwrap();
 
         assert_eq!(first.ip, Ipv4Addr::new(10, 77, 0, 2));
         assert_eq!(second.ip, Ipv4Addr::new(10, 77, 0, 3));
@@ -257,11 +379,11 @@ mod test {
         let network = NetworkId::random();
         let node = NodeId::random();
 
-        let first = registry.join(network, node, None, 8).unwrap();
+        let first = registry.join(network, node, None, None, 8).unwrap();
         registry.leave(network, node);
 
-        let other = registry.join(network, NodeId::random(), None, 8).unwrap();
-        let again = registry.join(network, node, None, 8).unwrap();
+        let other = registry.join(network, NodeId::random(), None, None, 8).unwrap();
+        let again = registry.join(network, node, None, None, 8).unwrap();
 
         assert_eq!(again.ip, first.ip, "the address is sticky");
         assert_ne!(other.ip, first.ip);
@@ -272,10 +394,10 @@ mod test {
         let registry = registry();
 
         let first = registry
-            .join(NetworkId::random(), NodeId::random(), None, 8)
+            .join(NetworkId::random(), NodeId::random(), None, None, 8)
             .unwrap();
         let second = registry
-            .join(NetworkId::random(), NodeId::random(), None, 8)
+            .join(NetworkId::random(), NodeId::random(), None, None, 8)
             .unwrap();
 
         assert_eq!(
@@ -292,9 +414,9 @@ mod test {
         let network = NetworkId::random();
 
         let alice = NodeId::random();
-        registry.join(network, alice, None, 8).unwrap();
+        registry.join(network, alice, None, None, 8).unwrap();
 
-        let bob = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let bob = registry.join(network, NodeId::random(), None, None, 8).unwrap();
 
         assert_eq!(bob.peers.len(), 1);
         assert_eq!(bob.peers[0].node, alice.to_string());
@@ -306,9 +428,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, None, 8).unwrap();
+        registry.join(network, bob, None, None, 8).unwrap();
 
         let update = alice.updates.recv().await.unwrap();
 
@@ -325,9 +447,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, None, 8).unwrap();
+        registry.join(network, bob, None, None, 8).unwrap();
 
         let _ = alice.updates.recv().await.unwrap();
 
@@ -347,9 +469,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, None, 8).unwrap();
+        registry.join(network, bob, None, None, 8).unwrap();
 
         let _ = alice.updates.recv().await.unwrap();
 
@@ -370,7 +492,7 @@ mod test {
         let network = NetworkId::random();
 
         let node = NodeId::random();
-        let mut joined = registry.join(network, node, None, 8).unwrap();
+        let mut joined = registry.join(network, node, None, None, 8).unwrap();
 
         registry.publish(network, node, vec!["203.0.113.7:51820".parse().unwrap()]);
 

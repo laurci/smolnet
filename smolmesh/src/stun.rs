@@ -238,7 +238,7 @@ mod test {
     #[test]
     fn mesh_datagrams_are_never_mistaken_for_stun() {
         let datagram = crate::wire::Datagram::new(
-            crate::wire::MessageType::Data,
+            crate::wire::MessageType::Keepalive,
             crate::NetworkId::random(),
             crate::NodeId::random(),
             b"payload",

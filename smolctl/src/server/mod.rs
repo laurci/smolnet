@@ -91,6 +91,8 @@ impl Control for ControlService {
         let identity = self.authenticate(&request)?;
         let remote = request.remote_addr();
 
+        let mut advertised = None;
+
         let leased = match &self.store {
             Some(store) => {
                 let device = store
@@ -105,6 +107,16 @@ impl Control for ControlService {
 
                 announce(&self.presence, &device, true);
 
+                let dropped =
+                    self.registry
+                        .evict_stale_nodes(identity.network, identity.node, device.ip);
+
+                if dropped > 0 {
+                    tracing::info!(dropped, ip = %device.ip, "reclaimed the address from earlier sessions");
+                }
+
+                advertised = device.public_key.clone();
+
                 Some(device.ip)
             }
             None => None,
@@ -112,7 +124,13 @@ impl Control for ControlService {
 
         let joined = self
             .registry
-            .join(identity.network, identity.node, leased, STREAM_CAPACITY)
+            .join(
+                identity.network,
+                identity.node,
+                leased,
+                advertised,
+                STREAM_CAPACITY,
+            )
             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         tracing::info!(
@@ -177,6 +195,19 @@ impl Control for ControlService {
                     Ok(ClientMessage {
                         body: Some(client_message::Body::Hello(hello)),
                     }) => {
+                        if !hello.public_key.is_empty()
+                            && registry.set_key(
+                                identity.network,
+                                identity.node,
+                                hello.public_key.clone(),
+                            )
+                        {
+                            tracing::info!(
+                                node = %identity.node,
+                                "published this device's live static key to its peers"
+                            );
+                        }
+
                         if let Some(store) = &store {
                             let _ = store
                                 .describe(
@@ -184,6 +215,7 @@ impl Control for ControlService {
                                     Some(hello.hostname.as_str()).filter(|text| !text.is_empty()),
                                     Some(hello.os.as_str()).filter(|text| !text.is_empty()),
                                     Some(hello.version.as_str()).filter(|text| !text.is_empty()),
+                                    Some(hello.public_key.as_str()).filter(|text| !text.is_empty()),
                                 )
                                 .await;
                         }

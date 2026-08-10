@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use smolmesh::keys::Keypair;
 use smolmesh::{Membership, MeshDevice, MeshHandle, NodeId, Observed, Peer, Peers};
 use smolnet::net::{Driver, Net};
 use thiserror::Error;
@@ -33,6 +34,7 @@ pub struct JoinConfig {
     pub stun: Vec<String>,
     pub hostname: Option<String>,
     pub version: Option<String>,
+    pub keys: Option<Keypair>,
 }
 
 fn plausible(name: String) -> Option<String> {
@@ -140,7 +142,15 @@ impl JoinConfig {
             stun: DEFAULT_STUN_SERVERS.map(str::to_owned).to_vec(),
             hostname: None,
             version: None,
+            keys: None,
         }
+    }
+
+    /// A binary mode device passes the key pair it keeps beside its device id;
+    /// a library mode device leaves this unset and gets a fresh one per process.
+    pub fn keys(mut self, keys: Keypair) -> JoinConfig {
+        self.keys = Some(keys);
+        self
     }
 
     pub fn hostname(mut self, hostname: impl Into<String>) -> JoinConfig {
@@ -162,6 +172,56 @@ impl JoinConfig {
         self.stun = servers;
         self
     }
+}
+
+/// One attempt at opening the control stream. Factored out of `join` so the
+/// session can redial with the same credentials when the stream drops.
+async fn dial(
+    config: &JoinConfig,
+) -> Result<(mpsc::Sender<ClientMessage>, Streaming<ServerMessage>), JoinError> {
+    let endpoint = Endpoint::from_shared(config.control.clone())
+        .map_err(|_| JoinError::Endpoint(config.control.clone()))?;
+
+    let channel = endpoint.connect().await.map_err(JoinError::Connect)?;
+    let mut client = ControlClient::new(channel);
+
+    let (outbound, requests) = mpsc::channel(OUTBOUND_CAPACITY);
+
+    let mut request = Request::new(ReceiverStream::new(requests));
+    let bearer = format!("Bearer {}", config.token);
+
+    request.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from(bearer).map_err(|_| JoinError::Token)?,
+    );
+
+    let hello = ClientMessage {
+        body: Some(crate::proto::client_message::Body::Hello(
+            crate::proto::Hello {
+                hostname: config
+                    .hostname
+                    .clone()
+                    .or_else(discovered_hostname)
+                    .unwrap_or_default(),
+                os: running_os().to_owned(),
+                version: config
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+                public_key: config
+                    .keys
+                    .as_ref()
+                    .map(|keys| keys.public().to_string())
+                    .unwrap_or_default(),
+            },
+        )),
+    };
+
+    let _ = outbound.send(hello).await;
+
+    let response = client.session(request).await.map_err(JoinError::Rejected)?;
+
+    Ok((outbound, response.into_inner()))
 }
 
 #[derive(Debug, Error)]
@@ -194,6 +254,9 @@ pub enum JoinError {
     Token,
 }
 
+pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
+pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
 pub struct Control {
     handle: MeshHandle,
     peers: Peers,
@@ -202,6 +265,7 @@ pub struct Control {
     outbound: mpsc::Sender<ClientMessage>,
     candidates: HashMap<NodeId, Vec<SocketAddr>>,
     stun: Vec<String>,
+    config: JoinConfig,
 }
 
 impl Control {
@@ -211,9 +275,10 @@ impl Control {
             peers,
             reflector,
             mut inbound,
-            outbound,
+            mut outbound,
             mut candidates,
             stun,
+            config,
         } = self;
 
         let local = local_candidate(reflector, handle.local_addr()?).await;
@@ -221,6 +286,7 @@ impl Control {
 
         let mut probe = tokio::time::interval(PROBE_INTERVAL);
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+        let mut backoff = RECONNECT_MIN;
 
         loop {
             tokio::select! {
@@ -248,11 +314,29 @@ impl Control {
                         }
                         Some(Err(e)) => {
                             tracing::warn!("control stream failed: {e}");
-                            break;
+
+                            match reconnect(&config, &mut backoff).await {
+                                Some((sender, stream)) => {
+                                    outbound = sender;
+                                    inbound = stream;
+
+                                    publish(&outbound, handle.observed(), local).await;
+                                }
+                                None => break,
+                            }
                         }
                         None => {
-                            tracing::info!("the control server closed the session");
-                            break;
+                            tracing::info!("the control server closed the session, reconnecting");
+
+                            match reconnect(&config, &mut backoff).await {
+                                Some((sender, stream)) => {
+                                    outbound = sender;
+                                    inbound = stream;
+
+                                    publish(&outbound, handle.observed(), local).await;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 }
@@ -293,44 +377,14 @@ impl Joined {
         }
     }
 
-    pub async fn join(config: JoinConfig) -> Result<Joined, JoinError> {
-        let endpoint = Endpoint::from_shared(config.control.clone())
-            .map_err(|_| JoinError::Endpoint(config.control.clone()))?;
+    pub async fn join(mut config: JoinConfig) -> Result<Joined, JoinError> {
+        // A library mode caller passes no key pair, so make one for this process
+        // and keep it in memory only; peers learn it through the control plane.
+        if config.keys.is_none() {
+            config.keys = Some(Keypair::generate().map_err(|_| JoinError::Token)?);
+        }
 
-        let channel = endpoint.connect().await.map_err(JoinError::Connect)?;
-        let mut client = ControlClient::new(channel);
-
-        let (outbound, requests) = mpsc::channel(OUTBOUND_CAPACITY);
-
-        let mut request = Request::new(ReceiverStream::new(requests));
-        let bearer = format!("Bearer {}", config.token);
-
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(bearer).map_err(|_| JoinError::Token)?,
-        );
-
-        let hello = ClientMessage {
-            body: Some(crate::proto::client_message::Body::Hello(
-                crate::proto::Hello {
-                    hostname: config
-                        .hostname
-                        .clone()
-                        .or_else(discovered_hostname)
-                        .unwrap_or_default(),
-                    os: running_os().to_owned(),
-                    version: config
-                        .version
-                        .clone()
-                        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
-                },
-            )),
-        };
-
-        let _ = outbound.send(hello).await;
-
-        let response = client.session(request).await.map_err(JoinError::Rejected)?;
-        let mut inbound = response.into_inner();
+        let (outbound, mut inbound) = dial(&config).await?;
 
         let welcome = match inbound.next().await {
             Some(Ok(ServerMessage {
@@ -390,7 +444,9 @@ impl Joined {
             "joined the network"
         );
 
-        let (device, handle) = MeshDevice::bind(config.bind, &membership)
+        let keys = config.keys.clone().expect("filled in above");
+
+        let (device, handle) = MeshDevice::bind(config.bind, &membership, keys)
             .await
             .map_err(JoinError::Socket)?;
 
@@ -408,7 +464,8 @@ impl Joined {
                 inbound,
                 outbound,
                 candidates,
-                stun: config.stun,
+                stun: config.stun.clone(),
+                config,
             },
         })
     }
@@ -476,6 +533,15 @@ fn decode_peer(state: &crate::proto::PeerState) -> Option<(Peer, Vec<SocketAddr>
 
     let mut peer = Peer::new(node, ip);
     peer.endpoint = endpoints.first().copied();
+
+    // Without the peer's static key there is no way to encrypt to it, and there
+    // is no plaintext fallback, so a peer that has not published one is simply
+    // unreachable until it does.
+    peer.key = state.public_key.parse().ok();
+
+    if peer.key.is_none() && !state.public_key.is_empty() {
+        tracing::warn!(node = state.node, "peer published an unreadable public key");
+    }
 
     Some((peer, endpoints))
 }
@@ -586,6 +652,31 @@ async fn publish(
 
     if outbound.send(message).await.is_err() {
         tracing::warn!("could not publish endpoints, the control stream is gone");
+    }
+}
+
+/// The mesh keeps running while the control plane is away; only the roster goes
+/// stale. Redial forever with a capped backoff rather than taking the node down.
+async fn reconnect(
+    config: &JoinConfig,
+    backoff: &mut Duration,
+) -> Option<(mpsc::Sender<ClientMessage>, Streaming<ServerMessage>)> {
+    loop {
+        tracing::info!(after = ?*backoff, "reconnecting to the control server");
+        tokio::time::sleep(*backoff).await;
+
+        match dial(config).await {
+            Ok(opened) => {
+                tracing::info!("the control stream is back");
+                *backoff = RECONNECT_MIN;
+
+                return Some(opened);
+            }
+            Err(e) => {
+                tracing::warn!("could not reconnect: {e}");
+                *backoff = (*backoff * 2).min(RECONNECT_MAX);
+            }
+        }
     }
 }
 
