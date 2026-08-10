@@ -96,6 +96,7 @@ pub struct Holder {
 pub enum Wanted<'a> {
     Existing(&'a str),
     Named(&'a str),
+    Rename { device: &'a str, name: &'a str },
     Throwaway,
     Fresh,
 }
@@ -340,6 +341,36 @@ impl Store {
                     Some(holder) if holder == owner => id.to_owned(),
                     Some(_) => return Err(StoreError::NotYours),
                     None => self.insert_device(owner, network, None, false).await?,
+                }
+            }
+
+            Wanted::Rename { device, name } => {
+                let holder: Option<String> = sqlx::query("SELECT owner FROM devices WHERE id = ?1")
+                    .bind(device)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(|row| row.get(0));
+
+                match holder {
+                    Some(holder) if holder != owner => return Err(StoreError::NotYours),
+                    Some(_) => {
+                        sqlx::query("UPDATE devices SET name = ?2 WHERE id = ?1")
+                            .bind(device)
+                            .bind(name)
+                            .execute(&self.pool)
+                            .await?;
+
+                        device.to_owned()
+                    }
+                    None => {
+                        return Box::pin(self.resolve_device(
+                            owner,
+                            network,
+                            Wanted::Named(name),
+                            node,
+                        ))
+                        .await;
+                    }
                 }
             }
 
@@ -903,6 +934,41 @@ mod test {
 
         assert_ne!(one.id, two.id, "a node is not an identifier");
         assert_ne!(one.ip, two.ip);
+    }
+
+    #[tokio::test]
+    async fn renaming_moves_the_name_rather_than_forking_the_device() {
+        let store = store().await;
+        let owner = owner(&store).await;
+        let network = network(&store, &owner).await;
+
+        let first = store
+            .resolve_device(&owner, &network, Wanted::Named("192.168.1.135"), "node-a")
+            .await
+            .unwrap();
+
+        let renamed = store
+            .resolve_device(
+                &owner,
+                &network,
+                Wanted::Rename {
+                    device: &first.id,
+                    name: "Laurcis-Mac",
+                },
+                "node-b",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(renamed.id, first.id, "the same device, corrected");
+        assert_eq!(renamed.ip, first.ip, "and it keeps its address");
+        assert_eq!(renamed.name.as_deref(), Some("Laurcis-Mac"));
+
+        assert_eq!(
+            store.devices(&owner).await.unwrap().len(),
+            1,
+            "renaming must not leave the old device behind"
+        );
     }
 
     #[tokio::test]

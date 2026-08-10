@@ -35,9 +35,49 @@ pub struct JoinConfig {
     pub version: Option<String>,
 }
 
+fn plausible(name: String) -> Option<String> {
+    let name = name.trim().trim_end_matches('.').to_owned();
+
+    // DHCP often hands macs a reverse resolved address as their hostname; an
+    // address is never a useful device name, so keep looking.
+    if name.is_empty() || name.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+
+    Some(name)
+}
+
+#[cfg(target_os = "macos")]
+fn preferred_name() -> Option<String> {
+    for key in ["LocalHostName", "ComputerName"] {
+        let output = std::process::Command::new("scutil")
+            .args(["--get", key])
+            .output()
+            .ok()?;
+
+        if output.status.success()
+            && let Ok(text) = String::from_utf8(output.stdout)
+            && let Some(name) = plausible(text)
+        {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn preferred_name() -> Option<String> {
+    None
+}
+
 pub fn discovered_hostname() -> Option<String> {
+    if let Some(name) = preferred_name() {
+        return Some(name);
+    }
+
     if let Ok(name) = std::env::var("HOSTNAME")
-        && !name.is_empty()
+        && let Some(name) = plausible(name)
     {
         return Some(name);
     }
@@ -48,19 +88,43 @@ pub fn discovered_hostname() -> Option<String> {
         libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len() - 1)
     };
 
-    if read != 0 {
-        return std::fs::read_to_string("/etc/hostname")
+    let from_kernel = if read == 0 {
+        let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(0);
+
+        std::str::from_utf8(&buffer[..end])
             .ok()
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty());
+            .map(str::to_owned)
+            .and_then(plausible)
+    } else {
+        None
+    };
+
+    from_kernel.or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .and_then(plausible)
+    })
+}
+
+#[cfg(test)]
+mod hostname_test {
+    use crate::client::plausible;
+
+    #[test]
+    fn an_address_is_never_accepted_as_a_device_name() {
+        assert_eq!(plausible("192.168.1.135".to_owned()), None);
+        assert_eq!(plausible("10.0.0.1".to_owned()), None);
+        assert_eq!(plausible("fe80::1".to_owned()), None);
+        assert_eq!(plausible("  ".to_owned()), None);
     }
 
-    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(0);
-
-    std::str::from_utf8(&buffer[..end])
-        .ok()
-        .map(str::to_owned)
-        .filter(|name| !name.is_empty())
+    #[test]
+    fn a_real_name_survives_trimming() {
+        assert_eq!(
+            plausible("  Laurcis-Mac.local.  ".to_owned()).as_deref(),
+            Some("Laurcis-Mac.local")
+        );
+    }
 }
 
 pub fn running_os() -> &'static str {

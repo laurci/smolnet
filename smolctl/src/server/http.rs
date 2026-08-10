@@ -474,7 +474,9 @@ async fn issue_token(
             body.name.as_deref(),
             body.ephemeral.unwrap_or(false),
         ) {
-            (_, Some(name), _) => Wanted::Named(name),
+            (_, Some(name), true) => Wanted::Named(name),
+            (Some(device), Some(name), false) => Wanted::Rename { device, name },
+            (None, Some(name), false) => Wanted::Named(name),
             (_, None, true) => Wanted::Throwaway,
             (Some(device), None, false) => Wanted::Existing(device),
             (None, None, false) => Wanted::Fresh,
