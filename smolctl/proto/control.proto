@@ -10,6 +10,7 @@ message ClientMessage {
   oneof body {
     Endpoints endpoints = 1;
     Heartbeat heartbeat = 2;
+    Hello hello = 3;
   }
 }
 
@@ -18,6 +19,12 @@ message Endpoints {
 }
 
 message Heartbeat {}
+
+message Hello {
+  string hostname = 1;
+  string os = 2;
+  string version = 3;
+}
 
 message ServerMessage {
   oneof body {
@@ -31,6 +38,8 @@ message Welcome {
   string network = 1;
   string node = 2;
   string ip = 3;
+  string device = 7;
+  string hostname = 8;
   string netmask = 4;
   string reflector = 5;
   repeated PeerState peers = 6;

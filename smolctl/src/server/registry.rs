@@ -96,6 +96,7 @@ impl Registry {
         &self,
         network: NetworkId,
         node: NodeId,
+        leased: Option<Ipv4Addr>,
         capacity: usize,
     ) -> Result<Joined, RegistryError> {
         let mut networks = self.networks.lock().unwrap();
@@ -104,9 +105,12 @@ impl Registry {
             .entry(network)
             .or_insert_with(|| Network::new(self.subnet, self.netmask));
 
-        let ip = match entry.members.get(&node) {
-            Some(member) => member.ip,
-            None => entry.allocate(network)?,
+        let ip = match leased {
+            Some(leased) => leased,
+            None => match entry.members.get(&node) {
+                Some(member) => member.ip,
+                None => entry.allocate(network)?,
+            },
         };
 
         let member = entry.members.entry(node).or_insert_with(|| Member {
@@ -116,6 +120,7 @@ impl Registry {
             online: false,
         });
 
+        member.ip = ip;
         member.online = true;
         let state = member.to_state();
 
@@ -238,8 +243,8 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let first = registry.join(network, NodeId::random(), 8).unwrap();
-        let second = registry.join(network, NodeId::random(), 8).unwrap();
+        let first = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let second = registry.join(network, NodeId::random(), None, 8).unwrap();
 
         assert_eq!(first.ip, Ipv4Addr::new(10, 77, 0, 2));
         assert_eq!(second.ip, Ipv4Addr::new(10, 77, 0, 3));
@@ -252,11 +257,11 @@ mod test {
         let network = NetworkId::random();
         let node = NodeId::random();
 
-        let first = registry.join(network, node, 8).unwrap();
+        let first = registry.join(network, node, None, 8).unwrap();
         registry.leave(network, node);
 
-        let other = registry.join(network, NodeId::random(), 8).unwrap();
-        let again = registry.join(network, node, 8).unwrap();
+        let other = registry.join(network, NodeId::random(), None, 8).unwrap();
+        let again = registry.join(network, node, None, 8).unwrap();
 
         assert_eq!(again.ip, first.ip, "the address is sticky");
         assert_ne!(other.ip, first.ip);
@@ -267,10 +272,10 @@ mod test {
         let registry = registry();
 
         let first = registry
-            .join(NetworkId::random(), NodeId::random(), 8)
+            .join(NetworkId::random(), NodeId::random(), None, 8)
             .unwrap();
         let second = registry
-            .join(NetworkId::random(), NodeId::random(), 8)
+            .join(NetworkId::random(), NodeId::random(), None, 8)
             .unwrap();
 
         assert_eq!(
@@ -287,9 +292,9 @@ mod test {
         let network = NetworkId::random();
 
         let alice = NodeId::random();
-        registry.join(network, alice, 8).unwrap();
+        registry.join(network, alice, None, 8).unwrap();
 
-        let bob = registry.join(network, NodeId::random(), 8).unwrap();
+        let bob = registry.join(network, NodeId::random(), None, 8).unwrap();
 
         assert_eq!(bob.peers.len(), 1);
         assert_eq!(bob.peers[0].node, alice.to_string());
@@ -301,9 +306,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, 8).unwrap();
+        registry.join(network, bob, None, 8).unwrap();
 
         let update = alice.updates.recv().await.unwrap();
 
@@ -320,9 +325,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, 8).unwrap();
+        registry.join(network, bob, None, 8).unwrap();
 
         let _ = alice.updates.recv().await.unwrap();
 
@@ -342,9 +347,9 @@ mod test {
         let registry = registry();
         let network = NetworkId::random();
 
-        let mut alice = registry.join(network, NodeId::random(), 8).unwrap();
+        let mut alice = registry.join(network, NodeId::random(), None, 8).unwrap();
         let bob = NodeId::random();
-        registry.join(network, bob, 8).unwrap();
+        registry.join(network, bob, None, 8).unwrap();
 
         let _ = alice.updates.recv().await.unwrap();
 
@@ -365,7 +370,7 @@ mod test {
         let network = NetworkId::random();
 
         let node = NodeId::random();
-        let mut joined = registry.join(network, node, 8).unwrap();
+        let mut joined = registry.join(network, node, None, 8).unwrap();
 
         registry.publish(network, node, vec!["203.0.113.7:51820".parse().unwrap()]);
 

@@ -11,48 +11,39 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use clap::Parser;
 use smolctl::{JoinConfig, Joined};
 use smolnet::net::Net;
 use smolnet::{addr::MacAddr, device::tap::TapDevice, stack::StackIdentity};
 use supervisor::Supervisor;
-use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
-#[command(
-    name = "smolrun",
-    about = "run an unmodified program with its tcp sockets served by smolnet"
-)]
-struct Args {
-    #[arg(long, default_value = "tap0")]
-    tap: String,
+pub struct RunConfig {
+    pub tap: String,
+    pub control: Option<String>,
+    pub token: Option<String>,
+    pub ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub mac: String,
+    pub workdir: Option<std::path::PathBuf>,
+    pub allow_io_uring: bool,
+    pub command: Vec<String>,
+}
 
-    #[arg(long, env = "SMOLCTL_CONTROL")]
-    control: Option<String>,
-
-    #[arg(long, env = "SMOLCTL_TOKEN", hide_env_values = true)]
-    token: Option<String>,
-
-    #[arg(long, default_value = "10.30.0.2")]
-    ip: Ipv4Addr,
-
-    #[arg(long, default_value = "255.255.255.0")]
-    netmask: Ipv4Addr,
-
-    #[arg(long, default_value = "10.30.0.1")]
-    gateway: Ipv4Addr,
-
-    #[arg(long, default_value = "02:de:ad:be:ef:11")]
-    mac: String,
-
-    #[arg(long)]
-    workdir: Option<std::path::PathBuf>,
-
-    #[arg(long)]
-    allow_io_uring: bool,
-
-    #[arg(last = true, required = true)]
-    command: Vec<String>,
+impl RunConfig {
+    pub fn new(command: Vec<String>) -> RunConfig {
+        RunConfig {
+            tap: "tap0".to_owned(),
+            control: None,
+            token: None,
+            ip: Ipv4Addr::new(10, 30, 0, 2),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(10, 30, 0, 1),
+            mac: "02:de:ad:be:ef:11".to_owned(),
+            workdir: None,
+            allow_io_uring: false,
+            command,
+        }
+    }
 }
 
 fn parse_mac(text: &str) -> Result<MacAddr, String> {
@@ -132,16 +123,10 @@ fn spawn(command: &[String], workdir: Option<&std::path::Path>) -> io::Result<Ha
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("smolrun=info,smolnet=warn")),
-        )
-        .init();
+pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if args.command.is_empty() {
+        return Err("no command to run".into());
+    }
 
     let (net, address, netmask) = match (&args.control, &args.token) {
         (Some(control), Some(token)) => {

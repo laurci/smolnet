@@ -37,6 +37,9 @@ struct Mint {
     #[arg(long)]
     node: Option<String>,
 
+    #[arg(long)]
+    device: Option<String>,
+
     #[arg(long, default_value_t = DEFAULT_TTL)]
     ttl: u64,
 }
@@ -58,6 +61,15 @@ struct Serve {
 
     #[arg(long, default_value_t = DEFAULT_NETMASK)]
     netmask: Ipv4Addr,
+
+    #[arg(long, default_value = "0.0.0.0:3000")]
+    console: SocketAddr,
+
+    #[arg(long, default_value = "smolctl.db")]
+    database: String,
+
+    #[arg(long)]
+    assets: Option<String>,
 }
 
 #[derive(Parser)]
@@ -90,12 +102,14 @@ async fn mint(cli: &Cli, args: &Mint) -> Result<(), Box<dyn Error>> {
             Some(node) => node.parse()?,
             None => NodeId::random(),
         },
+        device: args.device.clone().unwrap_or_else(|| "dev".to_owned()),
     };
 
-    let (jwt, claims) = token::mint(&secret(cli)?, identity, args.ttl)?;
+    let (jwt, claims) = token::mint(&secret(cli)?, identity.clone(), args.ttl)?;
 
     println!("network {}", identity.network);
     println!("node    {}", identity.node);
+    println!("device  {}", identity.device);
     println!("expires {}", claims.exp);
     println!();
     println!("{jwt}");
@@ -106,6 +120,34 @@ async fn mint(cli: &Cli, args: &Mint) -> Result<(), Box<dyn Error>> {
 async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
     let secret = secret(cli)?;
 
+    let store = smolctl::server::store::Store::open(&args.database).await?;
+
+    match store.reset_presence().await {
+        Ok(0) => {}
+        Ok(cleared) => tracing::info!(cleared, "cleared stale presence from the last run"),
+        Err(e) => tracing::warn!("could not clear stale presence: {e}"),
+    }
+
+    let (console, presence) = smolctl::server::http::Console::new(
+        store.clone(),
+        secret.clone(),
+        std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
+        std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+        std::env::var("SMOL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{}", args.console)),
+        args.assets.clone().map(std::path::PathBuf::from),
+    );
+
+    {
+        let console = console.clone();
+        let listen = args.console;
+
+        tokio::spawn(async move {
+            if let Err(e) = smolctl::server::http::serve(console, listen).await {
+                tracing::error!("console stopped: {e}");
+            }
+        });
+    }
+
     let reflector = Reflector::bind(args.reflect).await?;
     tokio::spawn(async move {
         if let Err(e) = reflector.run().await {
@@ -114,7 +156,9 @@ async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
     });
 
     let registry = Registry::new(args.subnet, args.netmask);
-    let service = ControlService::new(registry, secret, args.advertise.clone());
+    let service = ControlService::new(registry, secret, args.advertise.clone())
+        .with_store(store)
+        .with_presence(presence);
 
     tracing::info!(
         listen = %args.listen,

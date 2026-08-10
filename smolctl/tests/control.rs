@@ -52,7 +52,7 @@ async fn control() -> Control {
 }
 
 fn token_for(network: NetworkId, node: NodeId) -> String {
-    token::mint(SECRET, Identity { network, node }, DEFAULT_TTL)
+    token::mint(SECRET, Identity { network, node, device: "dev".to_owned() }, DEFAULT_TTL)
         .unwrap()
         .0
 }
@@ -100,6 +100,7 @@ async fn a_token_signed_with_another_secret_is_refused() {
         Identity {
             network: NetworkId::random(),
             node: NodeId::random(),
+            device: "dev".to_owned(),
         },
         DEFAULT_TTL,
     )
@@ -264,4 +265,87 @@ async fn nodes_on_different_networks_never_see_each_other() {
         first_peers.is_empty(),
         "a separate network id is a separate mesh"
     );
+}
+
+#[tokio::test]
+async fn a_device_keeps_its_address_when_it_reconnects_as_a_new_node() {
+    use smolctl::server::store::Store;
+
+    init_tracing();
+
+    let store = Store::memory().await.unwrap();
+    let owner = store
+        .upsert_user("subject", "someone@example.com", None)
+        .await
+        .unwrap()
+        .id;
+
+    let network = store.default_network(&owner).await.unwrap();
+    let id: NetworkId = network.id.parse().unwrap_or_else(|_| NetworkId::random());
+
+    let device = store
+        .resolve_device(
+            &owner,
+            &network.id,
+            smolctl::server::store::Wanted::Named("minecraft"),
+            "unset",
+        )
+        .await
+        .unwrap();
+
+    let reflector = Reflector::bind("127.0.0.1:0").await.unwrap();
+    let advertise = reflector.local_addr().unwrap().to_string();
+    tokio::spawn(reflector.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let service = ControlService::new(
+        Registry::new(DEFAULT_SUBNET, DEFAULT_NETMASK),
+        SECRET.to_vec(),
+        advertise,
+    )
+    .with_store(store.clone());
+
+    tokio::spawn(
+        Server::builder()
+            .add_service(service.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
+    let mut seen = Vec::new();
+
+    for _ in 0..2 {
+        let token = token::mint(
+            SECRET,
+            Identity {
+                network: id,
+                node: NodeId::random(),
+                device: device.id.clone(),
+            },
+            DEFAULT_TTL,
+        )
+        .unwrap()
+        .0;
+
+        let joined = smolctl::Joined::join(JoinConfig::new(url.clone(), token).hostname("laptop"))
+            .await
+            .unwrap();
+
+        seen.push(joined.membership.ip);
+
+        drop(joined);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    assert_eq!(
+        seen[0], seen[1],
+        "the same device gets the same address even as a brand new mesh node"
+    );
+    assert_eq!(seen[0], device.ip, "and it is the address the store leased it");
+
+    let listed = store.devices(&owner).await.unwrap();
+    assert_eq!(listed[0].hostname.as_deref(), Some("laptop"), "the hostname was beamed up");
+    assert_eq!(listed[0].os.as_deref(), Some(std::env::consts::OS));
+    assert!(listed[0].version.is_some(), "and so was the running version");
 }

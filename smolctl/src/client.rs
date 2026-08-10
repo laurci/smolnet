@@ -31,6 +31,40 @@ pub struct JoinConfig {
     pub token: String,
     pub bind: SocketAddr,
     pub stun: Vec<String>,
+    pub hostname: Option<String>,
+    pub version: Option<String>,
+}
+
+pub fn discovered_hostname() -> Option<String> {
+    if let Ok(name) = std::env::var("HOSTNAME")
+        && !name.is_empty()
+    {
+        return Some(name);
+    }
+
+    let mut buffer = [0u8; 256];
+
+    let read = unsafe {
+        libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len() - 1)
+    };
+
+    if read != 0 {
+        return std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+    }
+
+    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(0);
+
+    std::str::from_utf8(&buffer[..end])
+        .ok()
+        .map(str::to_owned)
+        .filter(|name| !name.is_empty())
+}
+
+pub fn running_os() -> &'static str {
+    std::env::consts::OS
 }
 
 impl JoinConfig {
@@ -40,7 +74,19 @@ impl JoinConfig {
             token: token.into(),
             bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             stun: DEFAULT_STUN_SERVERS.map(str::to_owned).to_vec(),
+            hostname: None,
+            version: None,
         }
+    }
+
+    pub fn hostname(mut self, hostname: impl Into<String>) -> JoinConfig {
+        self.hostname = Some(hostname.into());
+        self
+    }
+
+    pub fn version(mut self, version: impl Into<String>) -> JoinConfig {
+        self.version = Some(version.into());
+        self
     }
 
     pub fn bind(mut self, bind: SocketAddr) -> JoinConfig {
@@ -199,6 +245,25 @@ impl Joined {
             "authorization",
             MetadataValue::try_from(bearer).map_err(|_| JoinError::Token)?,
         );
+
+        let hello = ClientMessage {
+            body: Some(crate::proto::client_message::Body::Hello(
+                crate::proto::Hello {
+                    hostname: config
+                        .hostname
+                        .clone()
+                        .or_else(discovered_hostname)
+                        .unwrap_or_default(),
+                    os: running_os().to_owned(),
+                    version: config
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+                },
+            )),
+        };
+
+        let _ = outbound.send(hello).await;
 
         let response = client.session(request).await.map_err(JoinError::Rejected)?;
         let mut inbound = response.into_inner();
@@ -471,4 +536,135 @@ async fn local_candidate(reflector: SocketAddr, bound: SocketAddr) -> Option<Soc
     }
 
     Some(SocketAddr::new(address, bound.port()))
+}
+
+#[derive(Debug, Error)]
+pub enum ExchangeError {
+    #[error("could not reach the control server:\n{0}")]
+    Unreachable(reqwest::Error),
+
+    #[error("the control server refused the key: {0}")]
+    Refused(String),
+
+    #[error("the control server sent a reply we could not read:\n{0}")]
+    Malformed(reqwest::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct Issued {
+    pub token: String,
+    pub device: String,
+    pub ip: String,
+}
+
+pub async fn exchange(
+    api: &str,
+    key: &str,
+    node: &str,
+    device: Option<&str>,
+    name: Option<&str>,
+    ephemeral: bool,
+) -> Result<Issued, ExchangeError> {
+    let body = serde_json::json!({
+        "key": key,
+        "node": node,
+        "device": device,
+        "name": name,
+        "ephemeral": ephemeral,
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/token", api.trim_end_matches('/')))
+        .json(&body)
+        .send()
+        .await
+        .map_err(ExchangeError::Unreachable)?;
+
+    if !response.status().is_success() {
+        let detail = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "no detail".to_owned());
+
+        return Err(ExchangeError::Refused(detail));
+    }
+
+    let issued: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
+
+    Ok(Issued {
+        token: issued["token"].as_str().unwrap_or_default().to_owned(),
+        device: issued["device"].as_str().unwrap_or_default().to_owned(),
+        ip: issued["ip"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct Connect {
+    pub code: String,
+    pub secret: String,
+    pub url: String,
+}
+
+pub async fn start_connect(api: &str) -> Result<Connect, ExchangeError> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/connect", api.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(ExchangeError::Unreachable)?;
+
+    if !response.status().is_success() {
+        return Err(ExchangeError::Refused(
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
+
+    Ok(Connect {
+        code: body["code"].as_str().unwrap_or_default().to_owned(),
+        secret: body["secret"].as_str().unwrap_or_default().to_owned(),
+        url: body["url"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+pub async fn claim_connect(api: &str, connect: &Connect) -> Result<Option<String>, ExchangeError> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/connect/claim", api.trim_end_matches('/')))
+        .json(&serde_json::json!({ "code": connect.code, "secret": connect.secret }))
+        .send()
+        .await
+        .map_err(ExchangeError::Unreachable)?;
+
+    if response.status() == reqwest::StatusCode::ACCEPTED {
+        return Ok(None);
+    }
+
+    if !response.status().is_success() {
+        return Err(ExchangeError::Refused(
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
+
+    Ok(body["key"].as_str().map(str::to_owned))
+}
+
+pub async fn verify(api: &str, key: &str) -> Result<String, ExchangeError> {
+    let response = reqwest::Client::new()
+        .post(format!("{}/verify", api.trim_end_matches('/')))
+        .json(&serde_json::json!({ "key": key }))
+        .send()
+        .await
+        .map_err(ExchangeError::Unreachable)?;
+
+    if !response.status().is_success() {
+        return Err(ExchangeError::Refused(
+            response.text().await.unwrap_or_default(),
+        ));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
+
+    Ok(body["account"].as_str().unwrap_or_default().to_owned())
 }

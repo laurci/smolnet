@@ -14,14 +14,16 @@ pub struct Claims {
     pub iss: String,
     pub sub: String,
     pub net: String,
+    pub dev: String,
     pub iat: u64,
     pub exp: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub network: NetworkId,
     pub node: NodeId,
+    pub device: String,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +65,7 @@ pub fn mint(
         iss: ISSUER.to_owned(),
         sub: identity.node.to_string(),
         net: identity.network.to_string(),
+        dev: identity.device.clone(),
         iat: issued,
         exp: issued + ttl_seconds,
     };
@@ -91,6 +94,7 @@ pub fn verify(secret: &[u8], token: &str) -> Result<Identity, TokenError> {
     Ok(Identity {
         network: data.claims.net.parse().map_err(|_| TokenError::NetworkId)?,
         node: data.claims.sub.parse().map_err(|_| TokenError::NodeId)?,
+        device: data.claims.dev,
     })
 }
 
@@ -109,13 +113,14 @@ mod test {
         Identity {
             network: NetworkId::random(),
             node: NodeId::random(),
+            device: "dev".to_owned(),
         }
     }
 
     #[test]
     fn a_minted_token_verifies() {
         let identity = identity();
-        let (token, _) = mint(SECRET, identity, DEFAULT_TTL).unwrap();
+        let (token, _) = mint(SECRET, identity.clone(), DEFAULT_TTL).unwrap();
 
         assert_eq!(verify(SECRET, &token).unwrap(), identity);
     }
@@ -140,6 +145,7 @@ mod test {
             - 7200;
 
         let claims = Claims {
+            dev: "dev".to_owned(),
             iss: ISSUER.to_owned(),
             sub: identity.node.to_string(),
             net: identity.network.to_string(),
@@ -178,7 +184,7 @@ mod test {
     #[test]
     fn the_claims_carry_both_identifiers() {
         let identity = identity();
-        let (_, claims) = mint(SECRET, identity, DEFAULT_TTL).unwrap();
+        let (_, claims) = mint(SECRET, identity.clone(), DEFAULT_TTL).unwrap();
 
         assert_eq!(claims.sub, identity.node.to_string());
         assert_eq!(claims.net, identity.network.to_string());

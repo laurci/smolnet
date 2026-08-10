@@ -1,0 +1,31 @@
+[package]
+name = "smol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+serde = { version = "1", features = ["derive"] }
+smolctl.workspace = true
+toml = "0.9"
+smolmesh.workspace = true
+smolnet.workspace = true
+smolnode.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smolrun.workspace = true
+
+[dev-dependencies]
+smolmesh.workspace = true
+
+[lib]
+name = "smol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smol"
+path = "src/main.rs"

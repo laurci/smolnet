@@ -1,0 +1,12 @@
+[package]
+name = "smolnode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+smolctl.workspace = true
+smolmesh.workspace = true
+smolnet.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

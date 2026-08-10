@@ -2,41 +2,35 @@ use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Command;
 
-use clap::Parser;
 use smolctl::{JoinConfig, Joined};
 use smolmesh::{MESH_MTU, forward};
 use smolnet::device::Device;
-use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
-#[command(
-    name = "smolnode",
-    about = "join a smolmesh network and expose it as a local tun interface"
-)]
-struct Args {
-    #[arg(long, env = "SMOLCTL_CONTROL")]
-    control: String,
-
-    #[arg(long, env = "SMOLCTL_TOKEN", hide_env_values = true)]
-    token: String,
-
-    #[arg(long, default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
-
-    #[arg(long)]
-    interface: Option<String>,
-
-    #[arg(long, default_value_t = MESH_MTU)]
-    mtu: usize,
-
-    #[arg(long)]
-    stun: Vec<String>,
-
-    #[arg(long)]
-    no_configure: bool,
+pub struct NodeConfig {
+    pub control: String,
+    pub token: String,
+    pub bind: SocketAddr,
+    pub interface: Option<String>,
+    pub mtu: usize,
+    pub stun: Vec<String>,
+    pub configure_interface: bool,
 }
 
-fn run(command: &str, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
+impl NodeConfig {
+    pub fn new(control: impl Into<String>, token: impl Into<String>) -> NodeConfig {
+        NodeConfig {
+            control: control.into(),
+            token: token.into(),
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            interface: None,
+            mtu: MESH_MTU,
+            stun: Vec::new(),
+            configure_interface: true,
+        }
+    }
+}
+
+fn shell(command: &str, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
     tracing::info!(command, ?arguments, "configuring the interface");
 
     let output = Command::new(command).args(arguments).output()?;
@@ -64,8 +58,8 @@ fn configure(
     let address = format!("{ip}/{prefix}");
     let mtu = mtu.to_string();
 
-    run("ip", &["addr", "replace", &address, "dev", interface])?;
-    run("ip", &["link", "set", "dev", interface, "mtu", &mtu, "up"])?;
+    shell("ip", &["addr", "replace", &address, "dev", interface])?;
+    shell("ip", &["link", "set", "dev", interface, "mtu", &mtu, "up"])?;
 
     Ok(())
 }
@@ -87,11 +81,11 @@ fn configure(
     let prefix = u32::from(netmask.parse::<Ipv4Addr>()?).count_ones();
     let subnet = format!("{network}/{prefix}");
 
-    run(
+    shell(
         "ifconfig",
         &[interface, &ip, &ip, "netmask", &netmask, "mtu", &mtu, "up"],
     )?;
-    if let Err(e) = run(
+    if let Err(e) = shell(
         "route",
         &["-n", "add", "-net", &subnet, "-interface", interface],
     ) {
@@ -138,41 +132,31 @@ fn open_tunnel(_: Option<&str>, _: usize) -> Result<(impl Device, String), Box<d
     )
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
+    let mut joining = JoinConfig::new(config.control, config.token).bind(config.bind);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("smolnode=info,smolctl=info,smolmesh=info")),
-        )
-        .init();
-
-    let mut config = JoinConfig::new(args.control, args.token).bind(args.bind);
-
-    if !args.stun.is_empty() {
-        config = config.stun(args.stun);
+    if !config.stun.is_empty() {
+        joining = joining.stun(config.stun);
     }
 
-    let joined = Joined::join(config).await?;
+    let joined = Joined::join(joining).await?;
 
     let ip = joined.membership.ip;
     let netmask = joined.membership.netmask;
 
-    let (mut tunnel, interface) = open_tunnel(args.interface.as_deref(), args.mtu)?;
+    let (mut tunnel, interface) = open_tunnel(config.interface.as_deref(), config.mtu)?;
 
-    if args.no_configure {
-        tracing::warn!(interface, %ip, "skipping interface configuration as asked");
+    if config.configure_interface {
+        configure(&interface, ip, netmask, config.mtu)?;
     } else {
-        configure(&interface, ip, netmask, args.mtu)?;
+        tracing::warn!(interface, %ip, "skipping interface configuration as asked");
     }
 
     tracing::info!(
         interface,
         %ip,
         %netmask,
-        mtu = args.mtu,
+        mtu = config.mtu,
         "the mesh is up, bind your services to this address"
     );
 

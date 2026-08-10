@@ -1,4 +1,6 @@
+pub mod http;
 pub mod registry;
+pub mod store;
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -14,6 +16,8 @@ use crate::{
         server_message,
     },
     server::registry::Registry,
+    server::http::Presence,
+    server::store::Store,
     token::{self, Identity},
 };
 
@@ -21,6 +25,8 @@ const STREAM_CAPACITY: usize = 64;
 
 pub struct ControlService {
     registry: Registry,
+    store: Option<Store>,
+    presence: Option<tokio::sync::broadcast::Sender<Presence>>,
     secret: Vec<u8>,
     reflector: String,
 }
@@ -29,9 +35,24 @@ impl ControlService {
     pub fn new(registry: Registry, secret: Vec<u8>, reflector: String) -> ControlService {
         ControlService {
             registry,
+            store: None,
+            presence: None,
             secret,
             reflector,
         }
+    }
+
+    pub fn with_store(mut self, store: Store) -> ControlService {
+        self.store = Some(store);
+        self
+    }
+
+    pub fn with_presence(
+        mut self,
+        presence: tokio::sync::broadcast::Sender<Presence>,
+    ) -> ControlService {
+        self.presence = Some(presence);
+        self
     }
 
     pub fn into_server(self) -> ControlServer<ControlService> {
@@ -70,9 +91,28 @@ impl Control for ControlService {
         let identity = self.authenticate(&request)?;
         let remote = request.remote_addr();
 
+        let leased = match &self.store {
+            Some(store) => {
+                let device = store
+                    .device(&identity.device)
+                    .await
+                    .map_err(|e| Status::unauthenticated(format!("unknown device: {e}")))?;
+
+                store
+                    .mark(&device.id, true)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                announce(&self.presence, &device, true);
+
+                Some(device.ip)
+            }
+            None => None,
+        };
+
         let joined = self
             .registry
-            .join(identity.network, identity.node, STREAM_CAPACITY)
+            .join(identity.network, identity.node, leased, STREAM_CAPACITY)
             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         tracing::info!(
@@ -91,6 +131,8 @@ impl Control for ControlService {
                 netmask: joined.netmask.to_string(),
                 reflector: self.reflector.clone(),
                 peers: joined.peers,
+                device: identity.device.clone(),
+                hostname: String::new(),
             })),
         };
 
@@ -113,6 +155,9 @@ impl Control for ControlService {
         });
 
         let registry = self.registry.clone();
+        let store = self.store.clone();
+        let presence = self.presence.clone();
+        let device = identity.device.clone();
         let mut inbound = request.into_inner();
 
         tokio::spawn(async move {
@@ -129,6 +174,20 @@ impl Control for ControlService {
 
                         registry.publish(identity.network, identity.node, parsed);
                     }
+                    Ok(ClientMessage {
+                        body: Some(client_message::Body::Hello(hello)),
+                    }) => {
+                        if let Some(store) = &store {
+                            let _ = store
+                                .describe(
+                                    &device,
+                                    Some(hello.hostname.as_str()).filter(|text| !text.is_empty()),
+                                    Some(hello.os.as_str()).filter(|text| !text.is_empty()),
+                                    Some(hello.version.as_str()).filter(|text| !text.is_empty()),
+                                )
+                                .await;
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         tracing::debug!(node = ?identity.node, "control stream failed: {e}");
@@ -138,8 +197,36 @@ impl Control for ControlService {
             }
 
             registry.leave(identity.network, identity.node);
+
+            if let Some(store) = &store {
+                let _ = store.mark(&device, false).await;
+
+                if let Ok(gone) = store.device(&device).await {
+                    announce(&presence, &gone, false);
+                }
+
+                let _ = store.release(&device).await;
+            }
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
+}
+
+fn announce(
+    presence: &Option<tokio::sync::broadcast::Sender<Presence>>,
+    device: &crate::server::store::Device,
+    online: bool,
+) {
+    let Some(presence) = presence else {
+        return;
+    };
+
+    let _ = presence.send(Presence {
+        device: device.id.clone(),
+        name: device.name.clone(),
+        hostname: device.hostname.clone(),
+        ip: device.ip.to_string(),
+        online,
+    });
 }

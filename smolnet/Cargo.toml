@@ -1,0 +1,42 @@
+[package]
+name = "smolnet"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["tuntap"]
+axum = ["dep:axum"]
+tuntap = ["dep:nix"]
+
+[dependencies]
+axum = { version = "0.8", optional = true }
+net_header = { path = "../net_header" }
+rand = "0.10.2"
+thiserror = "2.0.20"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "io-util", "macros", "net"] }
+tracing = "0.1.44"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", features = ["ioctl", "poll", "fs"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31.3", features = ["ioctl", "fs", "socket", "net", "uio"], optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[[example]]
+name = "axum_hello"
+required-features = ["axum", "tuntap"]
+
+[[example]]
+name = "tcp_echo"
+required-features = ["tuntap"]
+
+[[example]]
+name = "tcp_client"
+required-features = ["tuntap"]
+
+[[example]]
+name = "udp_echo"
+required-features = ["tuntap"]

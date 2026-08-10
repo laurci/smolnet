@@ -1,0 +1,114 @@
+:root {
+  --bg: #0d0f12;
+  --panel: #14171c;
+  --line: #232830;
+  --text: #e6e9ef;
+  --dim: #8b93a1;
+  --live: #3fb950;
+  --off: #4a515c;
+  --accent: #6aa6ff;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a { color: var(--accent); }
+
+.shell { max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 0.95rem; margin: 2rem 0 0.75rem; color: var(--dim); font-weight: 600; }
+
+nav { display: flex; gap: 1rem; }
+nav a { text-decoration: none; color: var(--dim); }
+nav a.active { color: var(--text); }
+
+.meta { color: var(--dim); font-size: 0.85rem; }
+
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--dim);
+  font-size: 0.8rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+td { padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--line); }
+tbody tr:hover { background: var(--panel); }
+
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 0.5rem; }
+.dot.on { background: var(--live); box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.15); }
+.dot.off { background: var(--off); }
+
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+
+button {
+  font: inherit;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+input {
+  font: inherit;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.7rem;
+}
+
+.row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+
+.secret {
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.tag {
+  font-size: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+  color: var(--dim);
+}
+
+.empty { color: var(--dim); padding: 2rem 0; text-align: center; }
+
+.signin { text-align: center; padding: 6rem 1rem; }
+.signin a {
+  display: inline-block;
+  margin-top: 1.25rem;
+  padding: 0.6rem 1.2rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  text-decoration: none;
+  background: var(--panel);
+}
