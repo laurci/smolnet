@@ -46,6 +46,50 @@ impl RunConfig {
     }
 }
 
+struct Terminal {
+    ours: libc::pid_t,
+    handed: bool,
+}
+
+impl Terminal {
+    fn hand_over(group: libc::pid_t) -> Terminal {
+        let ours = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+
+        if ours < 0 {
+            return Terminal {
+                ours: 0,
+                handed: false,
+            };
+        }
+
+        // tcsetpgrp from a background group raises SIGTTOU at us; ignore it for
+        // the duration or we stop ourselves while trying to hand the job over.
+        let previous = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        let handed = unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, group) } == 0;
+        unsafe { libc::signal(libc::SIGTTOU, previous) };
+
+        if handed {
+            tracing::debug!(group, "handed the terminal to the target");
+        }
+
+        Terminal { ours, handed }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        if !self.handed {
+            return;
+        }
+
+        unsafe {
+            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(libc::STDIN_FILENO, self.ours);
+            libc::signal(libc::SIGTTOU, previous);
+        }
+    }
+}
+
 fn parse_mac(text: &str) -> Result<MacAddr, String> {
     let parts: Vec<&str> = text.split(':').collect();
 
@@ -180,6 +224,12 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let group = pid as libc::pid_t;
 
+    // The target runs in its own process group so we can take its children down
+    // with it. That also makes it a background group, and a background process
+    // reading the terminal is stopped with SIGTTIN, so hand it the terminal the
+    // way a shell hands it to a job.
+    let terminal = Terminal::hand_over(group);
+
     let stop = move || {
         tracing::info!(pid, "taking the target down with us");
 
@@ -188,10 +238,14 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+
+
     let status = tokio::select! {
         outcome = handover.exit => outcome.map_err(|_| io::Error::other("the target was never started"))??,
         _ = tokio::signal::ctrl_c() => {
             stop();
+            drop(terminal);
+
             return Ok(());
         }
     };
@@ -199,6 +253,9 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
     stop();
 
     tracing::info!(?status, "target exited");
+
+    // process::exit skips destructors, so give the terminal back by hand
+    drop(terminal);
 
     std::process::exit(status.code().unwrap_or(0));
 }

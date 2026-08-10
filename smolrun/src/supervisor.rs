@@ -28,6 +28,7 @@ const IOVEC_SIZE: u64 = 16;
 const IOV_MAX: usize = 1024;
 const MSG_TRUNC_FLAG: u32 = 0x20;
 const CLOSE_RANGE_CLOEXEC: u64 = 4;
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 type Arrival = (TcpStream, SocketAddrV4);
 
@@ -191,6 +192,7 @@ pub struct Supervisor {
     refs: HashMap<i32, usize>,
     pidfds: HashMap<u32, OwnedFd>,
     reconcile_at: Option<Instant>,
+    reconciled: Option<Instant>,
     undiscovered: usize,
     group: u32,
     allow_rings: bool,
@@ -325,6 +327,7 @@ impl Supervisor {
             refs: HashMap::new(),
             pidfds: HashMap::new(),
             reconcile_at: None,
+            reconciled: None,
             undiscovered: 0,
             group: pid,
             allow_rings,
@@ -424,6 +427,7 @@ impl Supervisor {
 
     fn reconcile(&mut self) {
         self.reconcile_at = None;
+        self.reconciled = Some(Instant::now());
 
         let Some(live) = self.live_inodes() else {
             return;
@@ -443,7 +447,12 @@ impl Supervisor {
     }
 
     fn soon(&mut self, delay: Duration) {
-        let at = Instant::now() + delay;
+        let floor = self
+            .reconciled
+            .map(|last| last + RECONCILE_INTERVAL)
+            .unwrap_or_else(Instant::now);
+
+        let at = (Instant::now() + delay).max(floor);
 
         self.reconcile_at = Some(match self.reconcile_at {
             Some(existing) if existing < at => existing,
@@ -871,7 +880,6 @@ impl Supervisor {
                 self.on_io_uring()
             }
             libc::SYS_close_range => self.on_close_range(args),
-            libc::SYS_execve | libc::SYS_execveat => self.on_execve(),
             libc::SYS_fork | libc::SYS_vfork => self.on_clone(args, 0),
             libc::SYS_clone => self.on_clone(args, args[0]),
             libc::SYS_clone3 => {
@@ -1974,14 +1982,6 @@ fn on_connect(&mut self, id: u64, args: [u64; 6]) -> io::Result<Answer> {
                 self.release(owner);
             }
         }
-
-        Ok(Answer::Continue)
-    }
-
-    fn on_execve(&mut self) -> io::Result<Answer> {
-        self.soon(Duration::from_millis(50));
-
-        tracing::debug!("the target is about to exec, its close on exec sockets will go");
 
         Ok(Answer::Continue)
     }

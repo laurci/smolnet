@@ -27,8 +27,6 @@ pub const INTERCEPTED: &[c_long] = &[
     libc::SYS_clone,
     libc::SYS_clone3,
     libc::SYS_close_range,
-    libc::SYS_execve,
-    libc::SYS_execveat,
     libc::SYS_io_uring_setup,
     libc::SYS_io_uring_enter,
     libc::SYS_io_uring_register,
