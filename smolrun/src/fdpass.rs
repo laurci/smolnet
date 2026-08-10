@@ -3,8 +3,6 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_void, cmsghdr, iovec, msghdr};
 
-const PAYLOAD: [u8; 1] = [0x2a];
-
 pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
 
@@ -24,8 +22,8 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-pub fn send(socket: BorrowedFd<'_>, payload: BorrowedFd<'_>) -> io::Result<()> {
-    let mut buffer = PAYLOAD;
+pub fn send(socket: BorrowedFd<'_>, payload: BorrowedFd<'_>, pid: u32) -> io::Result<()> {
+    let mut buffer = pid.to_ne_bytes();
     let mut space = [0u8; 32];
 
     let mut io_slice = iovec {
@@ -58,8 +56,8 @@ pub fn send(socket: BorrowedFd<'_>, payload: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-pub fn recv(socket: BorrowedFd<'_>) -> io::Result<OwnedFd> {
-    let mut buffer = [0u8; 1];
+pub fn recv(socket: BorrowedFd<'_>) -> io::Result<(OwnedFd, u32)> {
+    let mut buffer = [0u8; 4];
     let mut space = [0u8; 32];
 
     let mut io_slice = iovec {
@@ -86,6 +84,13 @@ pub fn recv(socket: BorrowedFd<'_>) -> io::Result<OwnedFd> {
         ));
     }
 
+    if received as usize != buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the child sent a truncated handover",
+        ));
+    }
+
     unsafe {
         let control = libc::CMSG_FIRSTHDR(&message);
 
@@ -101,7 +106,10 @@ pub fn recv(socket: BorrowedFd<'_>) -> io::Result<OwnedFd> {
 
         let source = libc::CMSG_DATA(control) as *const RawFd;
 
-        Ok(OwnedFd::from_raw_fd(source.read_unaligned()))
+        Ok((
+            OwnedFd::from_raw_fd(source.read_unaligned()),
+            u32::from_ne_bytes(buffer),
+        ))
     }
 }
 
@@ -117,8 +125,10 @@ mod test {
         let (left, right) = pair().unwrap();
         let (payload_a, payload_b) = pair().unwrap();
 
-        send(left.as_fd(), payload_a.as_fd()).unwrap();
-        let landed: OwnedFd = recv(right.as_fd()).unwrap();
+        send(left.as_fd(), payload_a.as_fd(), 4242).unwrap();
+        let (landed, pid): (OwnedFd, u32) = recv(right.as_fd()).unwrap();
+
+        assert_eq!(pid, 4242, "the sender's pid rides along with the descriptor");
 
         let mut writer = std::fs::File::from(landed);
         writer.write_all(b"through the door").unwrap();

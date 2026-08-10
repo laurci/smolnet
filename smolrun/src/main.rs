@@ -3,6 +3,7 @@ mod mem;
 mod notify;
 mod seccomp;
 mod supervisor;
+mod wake;
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -44,6 +45,12 @@ struct Args {
     #[arg(long, default_value = "02:de:ad:be:ef:11")]
     mac: String,
 
+    #[arg(long)]
+    workdir: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    allow_io_uring: bool,
+
     #[arg(last = true, required = true)]
     command: Vec<String>,
 }
@@ -64,31 +71,65 @@ fn parse_mac(text: &str) -> Result<MacAddr, String> {
     Ok(mac)
 }
 
-fn spawn(command: &[String]) -> io::Result<(std::process::Child, OwnedFd, OwnedFd)> {
+struct Handover {
+    listener: OwnedFd,
+    pid: u32,
+    gate: OwnedFd,
+    exit: tokio::sync::oneshot::Receiver<io::Result<std::process::ExitStatus>>,
+}
+
+fn spawn(command: &[String], workdir: Option<&std::path::Path>) -> io::Result<Handover> {
     let (ours, theirs) = fdpass::pair()?;
     let handover = theirs.as_fd().try_clone_to_owned()?;
-    let filter = seccomp::program(seccomp::INTERCEPTED);
+    let filter = seccomp::program(seccomp::INTERCEPTED, seccomp::BY_DESCRIPTOR);
 
     let mut child = Command::new(&command[0]);
     child.args(&command[1..]);
 
+    if let Some(workdir) = workdir {
+        child.current_dir(workdir);
+    }
+
     unsafe {
         child.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
             seccomp::set_no_new_privs()?;
 
             let listener = seccomp::install(&filter)?;
-            fdpass::send(handover.as_fd(), listener.as_fd())?;
+            fdpass::send(handover.as_fd(), listener.as_fd(), std::process::id())?;
 
             Ok(())
         });
     }
 
-    let child = child.spawn()?;
-    drop(theirs);
+    let (report, exit) = tokio::sync::oneshot::channel();
 
-    let listener = fdpass::recv(ours.as_fd())?;
+    std::thread::spawn(move || {
+        drop(theirs);
 
-    Ok((child, listener, ours))
+        let outcome = match child.spawn() {
+            Ok(mut started) => started.wait(),
+            Err(e) => Err(e),
+        };
+
+        let _ = report.send(outcome);
+    });
+
+    let (listener, pid) = fdpass::recv(ours.as_fd())?;
+
+    Ok(Handover {
+        listener,
+        pid,
+        gate: ours,
+        exit,
+    })
 }
 
 #[tokio::main]
@@ -102,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let (net, address) = match (&args.control, &args.token) {
+    let (net, address, netmask) = match (&args.control, &args.token) {
         (Some(control), Some(token)) => {
             let session = Joined::join(JoinConfig::new(control.clone(), token.clone()))
                 .await?
@@ -110,10 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let net = session.net();
             let address = session.ipv4_addr();
+            let netmask = session.membership().netmask;
 
             tokio::spawn(session.run());
 
-            (net, address)
+            (net, address, netmask)
         }
         _ => {
             let identity = StackIdentity {
@@ -126,12 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (net, driver): (Net, _) = smolnet::net::build(identity, device);
             tokio::spawn(driver.run());
 
-            (net, args.ip)
+            (net, args.ip, args.netmask)
         }
     };
 
-    let (mut child, listener, _gate) = spawn(&args.command)?;
-    let pid = child.id();
+    let handover = spawn(&args.command, args.workdir.as_deref())?;
+    let pid = handover.pid;
+    let _gate = handover.gate;
 
     tracing::info!(
         pid,
@@ -140,10 +183,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "supervising, its sockets now live on the smolnet stack"
     );
 
-    let supervisor = Supervisor::new(listener, pid, net, tokio::runtime::Handle::current())?;
+    let supervisor = Supervisor::new(
+        handover.listener,
+        pid,
+        net,
+        tokio::runtime::Handle::current(),
+        (address, netmask),
+        args.allow_io_uring,
+    )?;
     std::thread::spawn(move || supervisor.run());
 
-    let status = tokio::task::spawn_blocking(move || child.wait()).await??;
+    let group = pid as libc::pid_t;
+
+    let stop = move || {
+        tracing::info!(pid, "taking the target down with us");
+
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    };
+
+    let status = tokio::select! {
+        outcome = handover.exit => outcome.map_err(|_| io::Error::other("the target was never started"))??,
+        _ = tokio::signal::ctrl_c() => {
+            stop();
+            return Ok(());
+        }
+    };
+
+    stop();
 
     tracing::info!(?status, "target exited");
 

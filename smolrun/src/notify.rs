@@ -9,6 +9,7 @@ pub const NOTIF_ID_VALID: c_ulong = 0x4008_2102;
 pub const NOTIF_ADDFD: c_ulong = 0x4018_2103;
 
 pub const USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+pub const ADDFD_FLAG_SETFD: u32 = 1;
 pub const ADDFD_FLAG_SEND: u32 = 1 << 1;
 
 #[repr(C)]

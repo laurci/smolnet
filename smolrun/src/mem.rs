@@ -1,28 +1,58 @@
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::fs::FileExt;
 
 pub struct Memory {
-    file: File,
+    pid: u32,
+    file: RefCell<File>,
 }
 
 impl Memory {
     pub fn open(pid: u32) -> io::Result<Memory> {
-        let file = OpenOptions::new()
+        Ok(Memory {
+            pid,
+            file: RefCell::new(Memory::handle(pid)?),
+        })
+    }
+
+    fn handle(pid: u32) -> io::Result<File> {
+        OpenOptions::new()
             .read(true)
             .write(true)
-            .open(format!("/proc/{pid}/mem"))?;
+            .open(format!("/proc/{pid}/mem"))
+    }
 
-        Ok(Memory { file })
+    fn refresh(&self) -> io::Result<()> {
+        *self.file.borrow_mut() = Memory::handle(self.pid)?;
+
+        Ok(())
     }
 
     pub fn read(&self, address: u64, buffer: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact_at(buffer, address)
+        if self.file.borrow().read_exact_at(buffer, address).is_ok() {
+            return Ok(());
+        }
+
+        self.refresh()?;
+        self.file.borrow().read_exact_at(buffer, address)
     }
 
     pub fn write(&self, address: u64, buffer: &[u8]) -> io::Result<()> {
-        self.file.write_all_at(buffer, address)
+        if self.file.borrow().write_all_at(buffer, address).is_ok() {
+            return Ok(());
+        }
+
+        self.refresh()?;
+        self.file.borrow().write_all_at(buffer, address)
+    }
+
+    pub fn read_u64(&self, address: u64) -> io::Result<u64> {
+        let mut bytes = [0u8; 8];
+        self.read(address, &mut bytes)?;
+
+        Ok(u64::from_ne_bytes(bytes))
     }
 
     pub fn read_u32(&self, address: u64) -> io::Result<u32> {
@@ -83,6 +113,15 @@ impl Memory {
     }
 }
 
+impl Memory {
+    pub fn read_bytes(&self, address: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; len];
+        self.read(address, &mut buffer)?;
+
+        Ok(buffer)
+    }
+}
+
 pub fn encode_sockaddr_in(endpoint: SocketAddrV4) -> [u8; size_of::<libc::sockaddr_in>()] {
     let mut bytes = [0u8; size_of::<libc::sockaddr_in>()];
 
@@ -118,6 +157,28 @@ mod test {
         let memory = Memory::open(std::process::id()).unwrap();
 
         assert!(memory.read_sockaddr_in(encoded.as_ptr() as u64, 4).is_err());
+    }
+
+    #[test]
+    fn a_short_buffer_is_never_overrun() {
+        let mut guarded = [0xccu8; 32];
+        let capacity: u32 = 8;
+
+        let memory = Memory::open(std::process::id()).unwrap();
+
+        memory
+            .write_sockaddr_in(
+                guarded.as_mut_ptr() as u64,
+                &capacity as *const u32 as u64,
+                "10.77.0.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &guarded[8..],
+            &[0xcc; 24],
+            "writing past what the caller offered would corrupt its heap"
+        );
     }
 
     #[test]
