@@ -121,6 +121,57 @@ pub fn known_device_at(system: bool) -> Option<String> {
     read_device(&state_dir(system))
 }
 
+/// How long to wait for a daemon that is on its way out.
+///
+/// Restarting is a handover: the service manager starts the replacement while
+/// the one it killed is still winding down. Refusing instantly would turn every
+/// restart into a coin toss, so wait out a predecessor before giving up.
+pub const HANDOVER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hold the daemon lock for as long as this is alive.
+///
+/// Two daemons on one machine fight over everything that is meant to be the
+/// machine's: the tunnel, the resolver's address, and the roster entry for the
+/// device they share. However they were started, only one runs.
+pub fn claim_daemon(directory: &Path) -> Result<std::fs::File, Box<dyn Error>> {
+    claim_daemon_within(directory, HANDOVER)
+}
+
+pub fn claim_daemon_within(
+    directory: &Path,
+    patience: std::time::Duration,
+) -> Result<std::fs::File, Box<dyn Error>> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::create_dir_all(directory)?;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("daemon.lock"))?;
+
+    let deadline = std::time::Instant::now() + patience;
+
+    loop {
+        // Advisory, and released by the kernel however the holder goes away, so
+        // a daemon that is killed never leaves the next one locked out.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "another smol daemon is already running on this machine; \
+                 stop it with `sudo smol stop`"
+                    .into(),
+            );
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 pub fn read_device(directory: &Path) -> Option<String> {
     let found = std::fs::read_to_string(directory.join("device")).ok()?;
     let found = found.trim().to_owned();
@@ -258,8 +309,9 @@ pub fn resolve(control: Option<String>, key: Option<String>) -> Result<Config, B
 #[cfg(test)]
 mod test {
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
-    use crate::config::{Config, keys_in, read_device, write_device};
+    use crate::config::{Config, claim_daemon, claim_daemon_within, keys_in, read_device, write_device};
 
     #[test]
     fn a_config_round_trips_through_toml() {
@@ -277,6 +329,88 @@ mod test {
             Some("https://example.com:54189"),
             "the control port is never dialled in the clear"
         );
+    }
+
+    #[test]
+    fn only_one_daemon_may_hold_a_machine() {
+        let home = std::env::temp_dir().join(format!("smol-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+
+        let held = claim_daemon(&home).expect("the first daemon starts");
+
+        assert!(
+            claim_daemon_within(&home, Duration::from_millis(50)).is_err(),
+            "a second daemon would fight the first over the tunnel and the resolver"
+        );
+
+        drop(held);
+
+        assert!(
+            claim_daemon(&home).is_ok(),
+            "and once the first is gone the next one may start"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_restart_waits_for_the_daemon_it_is_replacing() {
+        let home = std::env::temp_dir().join(format!("smol-lock-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+
+        let held = claim_daemon(&home).expect("the daemon on its way out still holds it");
+
+        // Restarting starts the replacement before the old one has finished
+        // exiting. Waiting is the difference between a handover and a coin toss.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+
+        claim_daemon_within(&home, Duration::from_secs(5))
+            .expect("the replacement waits out its predecessor rather than refusing");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_killed_daemon_never_locks_out_the_next_one() {
+        let home = std::env::temp_dir().join(format!("smol-lock-kill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // SIGKILL leaves no chance to tidy up, which is exactly why the lock is
+        // the kernel's to release and not a file anyone has to remember to sweep.
+        let killed = std::process::Command::new("sh")
+            .arg("-c")
+            // exec, so killing this kills the holder: a forked child would
+            // inherit the descriptor and keep the lock after its parent died.
+            .arg(format!(
+                "exec 9>{}/daemon.lock; flock -x 9; exec sleep 30",
+                home.display()
+            ))
+            .spawn();
+
+        let Ok(mut killed) = killed else {
+            return;
+        };
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            claim_daemon_within(&home, Duration::from_millis(50)).is_err(),
+            "the lock has to actually be held for this test to mean anything"
+        );
+
+        killed.kill().ok();
+        killed.wait().ok();
+
+        assert!(
+            claim_daemon_within(&home, Duration::from_secs(5)).is_ok(),
+            "a daemon that was killed outright leaves nothing behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

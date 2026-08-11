@@ -299,6 +299,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let config = config::resolve(args.control, args.token)?;
 
+            // Held for the life of the process: a second daemon would open its
+            // own tunnel, claim the same address, and fight the first for the
+            // roster entry they share.
+            let _held = config::claim_daemon(&config::state_dir(true))?;
+
             let node_id = smolmesh::NodeId::random().to_string();
             let device = config::known_device();
 
@@ -331,6 +336,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             node.ca = issued.ca;
             node.keys = Some(config::keys_for(true, &issued.device)?);
+            node.renew = Some(smolctl::client::Renewal {
+                api: config.control.clone(),
+                key: config.key.clone(),
+                node: node_id.clone(),
+                device: Some(issued.device.clone()),
+                name: name.clone(),
+            });
             node.bind = args.bind;
             node.interface = args.interface;
             node.mtu = args.mtu;
@@ -384,6 +396,13 @@ async fn run_program(args: Run) -> Result<(), Box<dyn Error>> {
     run.control = Some(mesh);
     run.token = Some(issued.token);
     run.ca = issued.ca;
+    run.renew = Some(smolctl::client::Renewal {
+        api: config.control.clone(),
+        key: config.key.clone(),
+        node: node_id.clone(),
+        device: Some(issued.device.clone()),
+        name: args.name.clone(),
+    });
 
     // A throwaway device is gone the moment this exits, so its key has nothing
     // to outlive; a named one is the same device every run and keeps its own.

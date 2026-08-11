@@ -5,6 +5,10 @@ use std::process::Command;
 use smolctl::{JoinConfig, Joined};
 use smolmesh::{MESH_MTU, forward};
 use smolmesh::peer::ZONE;
+
+/// Where the resolver listens when it cannot take a whole address of its own.
+#[cfg(target_os = "macos")]
+const RESOLVER_PORT: u16 = 5354;
 use smolnet::device::Device;
 
 pub struct NodeConfig {
@@ -18,6 +22,7 @@ pub struct NodeConfig {
     pub serve_dns: bool,
     pub ca: Option<String>,
     pub keys: Option<smolmesh::keys::Keypair>,
+    pub renew: Option<smolctl::client::Renewal>,
 }
 
 impl NodeConfig {
@@ -33,6 +38,7 @@ impl NodeConfig {
             serve_dns: true,
             ca: None,
             keys: None,
+            renew: None,
         }
     }
 }
@@ -142,8 +148,15 @@ fn open_tunnel(_: Option<&str>, _: usize) -> Result<(impl Device, String), Box<d
 /// Claim the network's first host address and point the system resolver at it
 /// for our zone only. Every node answers this same address locally, so the
 /// configuration is identical on every machine.
+/// Point this machine's resolver at the mesh, and say where the resolver should
+/// then listen. The two are one decision: each platform has its own way of
+/// sending a zone somewhere, and the address that works follows from it.
 #[cfg(target_os = "linux")]
-fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<(), Box<dyn Error>> {
+fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<SocketAddr, Box<dyn Error>> {
+    let resolver_address = resolver;
+
+    // Adding the address to the link is what makes it local, so a query for it
+    // is delivered here rather than routed down the tunnel.
     shell("ip", &["addr", "replace", &format!("{resolver}/32"), "dev", interface])?;
 
     // resolved is the common case; without it the operator has to point their
@@ -157,29 +170,31 @@ fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<(), Box<dyn Erro
 
     shell("resolvectl", &["domain", interface, &format!("~{ZONE}")])?;
 
-    Ok(())
+    Ok(SocketAddr::from((resolver_address, 53)))
 }
 
+/// A tunnel address is the wrong place for a resolver on macos: utun is point
+/// to point, an alias on it never gets a local route, and the route covering the
+/// overlay then sends the query down the tunnel to a peer that does not exist.
+/// Loopback is unambiguously here, needs no alias and no route, and leaves port
+/// 53 to whatever else on the machine wants it.
 #[cfg(target_os = "macos")]
-fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<(), Box<dyn Error>> {
-    shell(
-        "ifconfig",
-        &[interface, "alias", &resolver.to_string(), "255.255.255.255"],
-    )?;
+fn configure_dns(_: &str, _: Ipv4Addr) -> Result<SocketAddr, Box<dyn Error>> {
+    let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, RESOLVER_PORT));
 
     // macos has no resolved; a file per domain under /etc/resolver is the
-    // supported way to send one zone somewhere else.
+    // supported way to send one zone somewhere else, port and all.
     std::fs::create_dir_all("/etc/resolver")?;
     std::fs::write(
         format!("/etc/resolver/{ZONE}"),
-        format!("nameserver {resolver}\n"),
+        format!("nameserver {}\nport {RESOLVER_PORT}\n", Ipv4Addr::LOCALHOST),
     )?;
 
-    Ok(())
+    Ok(listen)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn configure_dns(_: &str, _: Ipv4Addr) -> Result<(), Box<dyn Error>> {
+fn configure_dns(_: &str, _: Ipv4Addr) -> Result<SocketAddr, Box<dyn Error>> {
     Err("dns configuration is only implemented for linux and macos".into())
 }
 
@@ -190,6 +205,10 @@ pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
 
     if let Some(keys) = config.keys {
         joining = joining.keys(keys);
+    }
+
+    if let Some(renewal) = config.renew {
+        joining = joining.renew(renewal);
     }
 
     if !config.stun.is_empty() {
@@ -221,7 +240,7 @@ pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
 
     if config.serve_dns {
         match configure_dns(&interface, resolver) {
-            Ok(()) => {
+            Ok(listen) => {
                 let zone = smolmesh::dns::Zone::new(joined.peers.clone())
                     .with_self(
                         joined
@@ -233,14 +252,12 @@ pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
                     );
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        smolmesh::dns::serve(zone, SocketAddr::from((resolver, 53))).await
-                    {
+                    if let Err(e) = smolmesh::dns::serve(zone, listen).await {
                         tracing::error!("the resolver stopped: {e}");
                     }
                 });
 
-                tracing::info!(%resolver, "names under .{ZONE} resolve through this machine");
+                tracing::info!(%listen, "names under .{ZONE} resolve through this machine");
             }
             Err(e) => tracing::warn!("not serving dns: {e}"),
         }

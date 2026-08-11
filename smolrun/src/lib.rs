@@ -28,6 +28,7 @@ pub struct RunConfig {
     pub allow_io_uring: bool,
     pub ca: Option<String>,
     pub keys: Option<smolmesh::keys::Keypair>,
+    pub renew: Option<smolctl::client::Renewal>,
     pub command: Vec<String>,
 }
 
@@ -45,6 +46,7 @@ impl RunConfig {
             allow_io_uring: false,
             ca: None,
             keys: None,
+            renew: None,
             command,
         }
     }
@@ -182,6 +184,10 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(keys) = args.keys.clone() {
                 joining = joining.keys(keys);
+            }
+
+            if let Some(renewal) = args.renew.clone() {
+                joining = joining.renew(renewal);
             }
 
             let session = Joined::join(joining).await?.into_session();

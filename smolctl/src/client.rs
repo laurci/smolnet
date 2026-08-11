@@ -26,6 +26,20 @@ const OUTBOUND_CAPACITY: usize = 16;
 
 pub const DEFAULT_STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 
+/// What a node needs to mint itself a fresh join token.
+///
+/// A token is short lived and names one device. Neither the day it expires nor
+/// the device being removed can be recovered by retrying the token, so a node
+/// keeps the credential that earned it and asks again.
+#[derive(Debug, Clone)]
+pub struct Renewal {
+    pub api: String,
+    pub key: String,
+    pub node: String,
+    pub device: Option<String>,
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct JoinConfig {
     pub control: String,
@@ -39,6 +53,8 @@ pub struct JoinConfig {
     /// With one, that certificate is the only one this node will accept; with
     /// none, an https control url is checked against the usual public roots.
     pub ca: Option<String>,
+
+    pub renew: Option<Renewal>,
 }
 
 fn plausible(name: String) -> Option<String> {
@@ -148,7 +164,13 @@ impl JoinConfig {
             version: None,
             keys: None,
             ca: None,
+            renew: None,
         }
+    }
+
+    pub fn renew(mut self, renewal: Renewal) -> JoinConfig {
+        self.renew = Some(renewal);
+        self
     }
 
     pub fn ca(mut self, ca: Option<String>) -> JoinConfig {
@@ -318,7 +340,7 @@ impl Control {
             mut outbound,
             mut candidates,
             stun,
-            config,
+            mut config,
         } = self;
 
         let local = local_candidate(reflector, handle.local_addr()?).await;
@@ -355,27 +377,35 @@ impl Control {
                         Some(Err(e)) => {
                             tracing::warn!("control stream failed: {e}");
 
-                            match reconnect(&config, &mut backoff).await {
+                            match reconnect(&mut config, &mut backoff).await {
                                 Some((sender, stream)) => {
                                     outbound = sender;
                                     inbound = stream;
 
                                     publish(&outbound, handle.observed(), local).await;
                                 }
-                                None => break,
+                                None => {
+                                    return Err(std::io::Error::other(
+                                        "the control session cannot be restored, so start over",
+                                    ));
+                                }
                             }
                         }
                         None => {
                             tracing::info!("the control server closed the session, reconnecting");
 
-                            match reconnect(&config, &mut backoff).await {
+                            match reconnect(&mut config, &mut backoff).await {
                                 Some((sender, stream)) => {
                                     outbound = sender;
                                     inbound = stream;
 
                                     publish(&outbound, handle.observed(), local).await;
                                 }
-                                None => break,
+                                None => {
+                                    return Err(std::io::Error::other(
+                                        "the control session cannot be restored, so start over",
+                                    ));
+                                }
                             }
                         }
                     }
@@ -652,6 +682,7 @@ fn apply(
 
             tracing::info!(
                 ip = %peer.ip,
+                name = ?peer.name,
                 endpoints = ?endpoints,
                 online = state.online,
                 "peer updated"
@@ -744,7 +775,7 @@ async fn publish(
 /// The mesh keeps running while the control plane is away; only the roster goes
 /// stale. Redial forever with a capped backoff rather than taking the node down.
 async fn reconnect(
-    config: &JoinConfig,
+    config: &mut JoinConfig,
     backoff: &mut Duration,
 ) -> Option<(mpsc::Sender<ClientMessage>, Streaming<ServerMessage>)> {
     loop {
@@ -760,10 +791,72 @@ async fn reconnect(
             }
             Err(e) => {
                 tracing::warn!("could not reconnect: {e}");
+
+                if !renewed(config).await {
+                    return None;
+                }
+
                 *backoff = (*backoff * 2).min(RECONNECT_MAX);
             }
         }
     }
+}
+
+/// Whether a renewed token still names the device this node has been running as.
+/// A different one means the old device is gone and this is a new machine as far
+/// as the mesh is concerned, holding an address that is no longer its own.
+fn still_us(renewal: &Renewal, issued: &Issued) -> bool {
+    renewal
+        .device
+        .as_ref()
+        .is_none_or(|was| was == &issued.device)
+}
+
+/// Mint a fresh join token before the next attempt. Returns false when this node
+/// is no longer the device it was, which no amount of reconnecting can mend:
+/// its address has moved, and starting over is the only honest answer.
+async fn renewed(config: &mut JoinConfig) -> bool {
+    let Some(renewal) = config.renew.clone() else {
+        return true;
+    };
+
+    let issued = match exchange(
+        &renewal.api,
+        &renewal.key,
+        &renewal.node,
+        renewal.device.as_deref(),
+        renewal.name.as_deref(),
+        false,
+        false,
+    )
+    .await
+    {
+        Ok(issued) => issued,
+        Err(e) => {
+            tracing::warn!("could not renew the join token: {e}");
+            return true;
+        }
+    };
+
+    if !still_us(&renewal, &issued) {
+        tracing::error!(
+            was = ?renewal.device,
+            now = %issued.device,
+            "this machine is a different device than it was, and its address with it"
+        );
+
+        return false;
+    }
+
+    tracing::info!("minted a fresh join token");
+
+    config.token = issued.token;
+
+    if issued.ca.is_some() {
+        config.ca = issued.ca;
+    }
+
+    true
 }
 
 async fn local_candidate(reflector: SocketAddr, bound: SocketAddr) -> Option<SocketAddr> {
@@ -1040,5 +1133,48 @@ mod issued_test {
                 "an absent certificate must not become a pin nothing can match"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod renewal_test {
+    use crate::client::{Issued, Renewal, still_us};
+
+    fn renewal(device: Option<&str>) -> Renewal {
+        Renewal {
+            api: "https://control/api".to_owned(),
+            key: "smol_key".to_owned(),
+            node: "node".to_owned(),
+            device: device.map(str::to_owned),
+            name: Some("laptop".to_owned()),
+        }
+    }
+
+    fn issued(device: &str) -> Issued {
+        Issued {
+            token: "jwt".to_owned(),
+            device: device.to_owned(),
+            ip: "10.0.0.2".to_owned(),
+            name: "laptop".to_owned(),
+            ca: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_token_for_the_same_device_carries_on() {
+        assert!(still_us(&renewal(Some("dev1")), &issued("dev1")));
+    }
+
+    #[test]
+    fn a_token_for_another_device_means_starting_over() {
+        assert!(
+            !still_us(&renewal(Some("dev1")), &issued("dev2")),
+            "the address moved with the device, and no reconnect can mend that"
+        );
+    }
+
+    #[test]
+    fn a_node_that_never_had_a_device_takes_what_it_is_given() {
+        assert!(still_us(&renewal(None), &issued("dev9")));
     }
 }
