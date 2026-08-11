@@ -95,7 +95,13 @@ pub struct Holder {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Wanted<'a> {
-    Existing(&'a str),
+    /// A device the caller already holds. `fallback` is the name to fall back
+    /// to when that device is gone, so a machine whose device was deleted comes
+    /// back under its own name rather than as an anonymous one.
+    Existing {
+        device: &'a str,
+        fallback: Option<&'a str>,
+    },
     /// An exact name the user asked for: reuse the device that holds it.
     Named(&'a str),
     /// A name derived from the machine, so only a hint: normalise it and take
@@ -380,17 +386,28 @@ impl Store {
         node: &str,
     ) -> Result<Device, StoreError> {
         let id = match wanted {
-            Wanted::Existing(id) => {
+            Wanted::Existing { device, fallback } => {
                 let holder: Option<String> = sqlx::query("SELECT owner FROM devices WHERE id = ?1")
-                    .bind(id)
+                    .bind(device)
                     .fetch_optional(&self.pool)
                     .await?
                     .map(|row| row.get(0));
 
                 match holder {
-                    Some(holder) if holder == owner => id.to_owned(),
+                    Some(holder) if holder == owner => device.to_owned(),
                     Some(_) => return Err(StoreError::NotYours),
-                    None => self.insert_device(owner, network, None, false).await?,
+                    None => match fallback {
+                        Some(name) => {
+                            return Box::pin(self.resolve_device(
+                                owner,
+                                network,
+                                Wanted::Suggested(name),
+                                node,
+                            ))
+                            .await;
+                        }
+                        None => self.insert_device(owner, network, None, false).await?,
+                    },
                 }
             }
 
@@ -1003,7 +1020,7 @@ mod test {
             .unwrap();
 
         let again = store
-            .resolve_device(&owner, &network, Wanted::Existing(&first.id), "node-b")
+            .resolve_device(&owner, &network, Wanted::Existing { device: &first.id, fallback: None }, "node-b")
             .await
             .unwrap();
 
@@ -1228,7 +1245,7 @@ mod test {
 
         assert!(matches!(
             store
-                .resolve_device(&mine, &network, Wanted::Existing(&their_device.id), "node-y")
+                .resolve_device(&mine, &network, Wanted::Existing { device: &their_device.id, fallback: None }, "node-y")
                 .await,
             Err(StoreError::NotYours)
         ));
@@ -1245,7 +1262,7 @@ mod test {
         let network = network(&store, &owner).await;
 
         let device = store
-            .resolve_device(&owner, &network, Wanted::Existing("no-such-device"), "node-a")
+            .resolve_device(&owner, &network, Wanted::Existing { device: "no-such-device", fallback: None }, "node-a")
             .await
             .unwrap();
 

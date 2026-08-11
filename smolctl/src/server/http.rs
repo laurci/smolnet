@@ -542,7 +542,7 @@ fn wanted<'a>(
 ) -> Wanted<'a> {
     if !holder.session {
         return match (holder.device.as_deref(), name) {
-            (Some(device), _) => Wanted::Existing(device),
+            (Some(device), fallback) => Wanted::Existing { device, fallback },
             (None, Some(name)) => Wanted::Named(name),
             (None, None) => Wanted::Fresh,
         };
@@ -559,7 +559,7 @@ fn wanted<'a>(
         // A device we already know is this machine's identity. A name derived
         // from the hostname is only a hint, and must never mint a second device
         // for a machine that already has one.
-        (Some(device), _) => Wanted::Existing(device),
+        (Some(device), fallback) => Wanted::Existing { device, fallback },
 
         (None, Some(name)) if exact => Wanted::Named(name),
         (None, Some(name)) => Wanted::Suggested(name),
@@ -767,7 +767,10 @@ mod wanted_test {
         let chosen = wanted(&holder, Some("dev1"), Some("laurentius-macbook-pro"), false, false);
 
         assert!(
-            matches!(chosen, Wanted::Existing("dev1")),
+            matches!(
+                chosen,
+                Wanted::Existing { device: "dev1", fallback: Some("laurentius-macbook-pro") }
+            ),
             "a hostname must never mint a second device for a machine that has one, got {chosen:?}"
         );
     }
@@ -778,6 +781,19 @@ mod wanted_test {
         let chosen = wanted(&holder, None, Some("laurentius-macbook-pro"), false, false);
 
         assert!(matches!(chosen, Wanted::Suggested("laurentius-macbook-pro")), "got {chosen:?}");
+    }
+
+    #[test]
+    fn a_machine_whose_device_was_deleted_comes_back_under_its_own_name() {
+        let holder = session();
+        let chosen = wanted(&holder, Some("deleted"), Some("laurentius-macbook-pro"), false, false);
+
+        // The store takes the fallback only when the device is really gone, so
+        // a machine cleaned out of the console does not return as unnamed.
+        assert!(
+            matches!(chosen, Wanted::Existing { fallback: Some("laurentius-macbook-pro"), .. }),
+            "got {chosen:?}"
+        );
     }
 
     #[test]
@@ -808,7 +824,7 @@ mod wanted_test {
         let chosen = wanted(&holder, Some("other"), Some("elsewhere"), true, false);
 
         assert!(
-            matches!(chosen, Wanted::Existing("bound")),
+            matches!(chosen, Wanted::Existing { device: "bound", .. }),
             "a library key must ignore what the caller asks for, got {chosen:?}"
         );
     }
