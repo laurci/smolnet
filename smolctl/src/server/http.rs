@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::server::store::{Device, Store, User};
+use crate::server::store::{Device, Holder, Store, User, Wanted};
 use crate::token::{self, Identity};
 
 const SESSION_COOKIE: &str = "smol_session";
@@ -439,8 +439,6 @@ async fn issue_token(
 ) -> Response {
     let node = body.node.clone();
 
-    use crate::server::store::{Holder, Wanted};
-
     let holder = if let Some(key) = body.key.as_deref() {
         match console.store.key_owner(key).await {
             Ok(holder) => holder,
@@ -477,25 +475,13 @@ async fn issue_token(
     let exact = body.exact.unwrap_or(true);
     let ephemeral = body.ephemeral.unwrap_or(false);
 
-    let wanted = if holder.session {
-        match (body.device.as_deref(), body.name.as_deref()) {
-            (_, Some(name)) if ephemeral => Wanted::Named(name),
-            (Some(device), Some(name)) if exact => Wanted::Rename { device, name },
-            (_, Some(name)) if exact => Wanted::Named(name),
-            (_, Some(name)) => Wanted::Suggested(name),
-            (_, None) if ephemeral => Wanted::Throwaway,
-            (Some(device), None) => Wanted::Existing(device),
-            (None, None) => Wanted::Fresh,
-        }
-    } else {
-        match holder.device.as_deref() {
-            Some(device) => Wanted::Existing(device),
-            None => match body.name.as_deref() {
-                Some(name) => Wanted::Named(name),
-                None => Wanted::Fresh,
-            },
-        }
-    };
+    let wanted = wanted(
+        &holder,
+        body.device.as_deref(),
+        body.name.as_deref(),
+        exact,
+        ephemeral,
+    );
 
     let outcome = console
         .store
@@ -538,6 +524,46 @@ async fn issue_token(
         }))
         .into_response(),
         Err(e) => failed(e),
+    }
+}
+
+/// What device this request is asking for.
+///
+/// A library auth key stands for exactly one device: it ignores what the caller
+/// asks for and always lands on the device it is bound to. A cli session speaks
+/// for the account, so it may name, reuse, or throw away as many devices as it
+/// likes.
+fn wanted<'a>(
+    holder: &'a Holder,
+    device: Option<&'a str>,
+    name: Option<&'a str>,
+    exact: bool,
+    ephemeral: bool,
+) -> Wanted<'a> {
+    if !holder.session {
+        return match (holder.device.as_deref(), name) {
+            (Some(device), _) => Wanted::Existing(device),
+            (None, Some(name)) => Wanted::Named(name),
+            (None, None) => Wanted::Fresh,
+        };
+    }
+
+    match (device, name) {
+        // A throwaway is a fresh device every time by definition.
+        (_, Some(name)) if ephemeral => Wanted::Named(name),
+        (_, None) if ephemeral => Wanted::Throwaway,
+
+        // Naming a device by hand is the one way to move a name onto it.
+        (Some(device), Some(name)) if exact => Wanted::Rename { device, name },
+
+        // A device we already know is this machine's identity. A name derived
+        // from the hostname is only a hint, and must never mint a second device
+        // for a machine that already has one.
+        (Some(device), _) => Wanted::Existing(device),
+
+        (None, Some(name)) if exact => Wanted::Named(name),
+        (None, Some(name)) => Wanted::Suggested(name),
+        (None, None) => Wanted::Fresh,
     }
 }
 
@@ -708,4 +734,82 @@ pub async fn serve(console: Arc<Console>, listen: SocketAddr) -> std::io::Result
     tracing::info!(%listen, "console listening");
 
     axum::serve(listener, router(console)).await
+}
+
+#[cfg(test)]
+mod wanted_test {
+    use crate::server::http::wanted;
+    use crate::server::store::{Holder, Wanted};
+
+    fn session() -> Holder {
+        Holder {
+            owner: "someone".to_owned(),
+            network: "net".to_owned(),
+            session: true,
+            device: None,
+        }
+    }
+
+    fn auth_key(device: Option<&str>) -> Holder {
+        Holder {
+            owner: "someone".to_owned(),
+            network: "net".to_owned(),
+            session: false,
+            device: device.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn signing_in_again_lands_on_the_same_device() {
+        // `smol login` with no --name: the name is derived from the hostname, so
+        // it is only a suggestion, but the machine already knows its device id.
+        let holder = session();
+        let chosen = wanted(&holder, Some("dev1"), Some("laurentius-macbook-pro"), false, false);
+
+        assert!(
+            matches!(chosen, Wanted::Existing("dev1")),
+            "a hostname must never mint a second device for a machine that has one, got {chosen:?}"
+        );
+    }
+
+    #[test]
+    fn the_first_sign_in_takes_the_hostname_as_a_hint() {
+        let holder = session();
+        let chosen = wanted(&holder, None, Some("laurentius-macbook-pro"), false, false);
+
+        assert!(matches!(chosen, Wanted::Suggested("laurentius-macbook-pro")), "got {chosen:?}");
+    }
+
+    #[test]
+    fn naming_a_machine_by_hand_moves_the_name_onto_it() {
+        let holder = session();
+        let chosen = wanted(&holder, Some("dev1"), Some("workshop"), true, false);
+
+        assert!(
+            matches!(chosen, Wanted::Rename { device: "dev1", name: "workshop" }),
+            "got {chosen:?}"
+        );
+    }
+
+    #[test]
+    fn a_throwaway_run_never_reuses_the_machines_device() {
+        let holder = session();
+
+        assert!(matches!(wanted(&holder, Some("dev1"), None, true, true), Wanted::Throwaway));
+        assert!(matches!(
+            wanted(&holder, None, Some("scratch"), true, true),
+            Wanted::Named("scratch")
+        ));
+    }
+
+    #[test]
+    fn an_auth_key_only_ever_speaks_for_the_device_it_is_bound_to() {
+        let holder = auth_key(Some("bound"));
+        let chosen = wanted(&holder, Some("other"), Some("elsewhere"), true, false);
+
+        assert!(
+            matches!(chosen, Wanted::Existing("bound")),
+            "a library key must ignore what the caller asks for, got {chosen:?}"
+        );
+    }
 }
