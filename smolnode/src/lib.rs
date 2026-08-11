@@ -4,6 +4,7 @@ use std::process::Command;
 
 use smolctl::{JoinConfig, Joined};
 use smolmesh::{MESH_MTU, forward};
+use smolmesh::peer::ZONE;
 use smolnet::device::Device;
 
 pub struct NodeConfig {
@@ -14,6 +15,9 @@ pub struct NodeConfig {
     pub mtu: usize,
     pub stun: Vec<String>,
     pub configure_interface: bool,
+    pub serve_dns: bool,
+    pub ca: Option<String>,
+    pub keys: Option<smolmesh::keys::Keypair>,
 }
 
 impl NodeConfig {
@@ -26,6 +30,9 @@ impl NodeConfig {
             mtu: MESH_MTU,
             stun: Vec::new(),
             configure_interface: true,
+            serve_dns: true,
+            ca: None,
+            keys: None,
         }
     }
 }
@@ -132,8 +139,58 @@ fn open_tunnel(_: Option<&str>, _: usize) -> Result<(impl Device, String), Box<d
     )
 }
 
+/// Claim the network's first host address and point the system resolver at it
+/// for our zone only. Every node answers this same address locally, so the
+/// configuration is identical on every machine.
+#[cfg(target_os = "linux")]
+fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<(), Box<dyn Error>> {
+    shell("ip", &["addr", "replace", &format!("{resolver}/32"), "dev", interface])?;
+
+    // resolved is the common case; without it the operator has to point their
+    // own resolver at us, so a failure here is worth saying out loud but is not
+    // fatal to the mesh itself.
+    let resolver = resolver.to_string();
+
+    if let Err(e) = shell("resolvectl", &["dns", interface, &resolver]) {
+        return Err(format!("could not hand resolved our address: {e}").into());
+    }
+
+    shell("resolvectl", &["domain", interface, &format!("~{ZONE}")])?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_dns(interface: &str, resolver: Ipv4Addr) -> Result<(), Box<dyn Error>> {
+    shell(
+        "ifconfig",
+        &[interface, "alias", &resolver.to_string(), "255.255.255.255"],
+    )?;
+
+    // macos has no resolved; a file per domain under /etc/resolver is the
+    // supported way to send one zone somewhere else.
+    std::fs::create_dir_all("/etc/resolver")?;
+    std::fs::write(
+        format!("/etc/resolver/{ZONE}"),
+        format!("nameserver {resolver}\n"),
+    )?;
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn configure_dns(_: &str, _: Ipv4Addr) -> Result<(), Box<dyn Error>> {
+    Err("dns configuration is only implemented for linux and macos".into())
+}
+
 pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
-    let mut joining = JoinConfig::new(config.control, config.token).bind(config.bind);
+    let mut joining = JoinConfig::new(config.control, config.token)
+        .bind(config.bind)
+        .ca(config.ca);
+
+    if let Some(keys) = config.keys {
+        joining = joining.keys(keys);
+    }
 
     if !config.stun.is_empty() {
         joining = joining.stun(config.stun);
@@ -159,6 +216,35 @@ pub async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         mtu = config.mtu,
         "the mesh is up, bind your services to this address"
     );
+
+    let resolver = smolmesh::dns::resolver_address(ip, netmask);
+
+    if config.serve_dns {
+        match configure_dns(&interface, resolver) {
+            Ok(()) => {
+                let zone = smolmesh::dns::Zone::new(joined.peers.clone())
+                    .with_self(
+                        joined
+                            .membership
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "this".to_owned()),
+                        ip,
+                    );
+
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        smolmesh::dns::serve(zone, SocketAddr::from((resolver, 53))).await
+                    {
+                        tracing::error!("the resolver stopped: {e}");
+                    }
+                });
+
+                tracing::info!(%resolver, "names under .{ZONE} resolve through this machine");
+            }
+            Err(e) => tracing::warn!("not serving dns: {e}"),
+        }
+    }
 
     let mut mesh = joined.device;
     let control = tokio::spawn(joined.control.run());

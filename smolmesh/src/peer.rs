@@ -4,27 +4,58 @@ use std::sync::{Arc, Mutex};
 
 use crate::id::NodeId;
 
+/// The overlay's top level domain.
+pub const ZONE: &str = "smol";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     pub node: NodeId,
     pub ip: Ipv4Addr,
+    /// Where we believe this peer answers. Starts as a guess and is corrected
+    /// to whichever address it actually spoke to us from.
     pub endpoint: Option<SocketAddr>,
+    /// Every address the peer published. A peer behind the same nat as us, or
+    /// on this very machine, is only reachable on one of the later ones.
+    pub candidates: Vec<SocketAddr>,
     pub key: Option<crate::keys::PublicKey>,
+    pub name: Option<String>,
 }
 
 impl Peer {
     pub fn new(node: NodeId, ip: Ipv4Addr) -> Peer {
         Peer {
             key: None,
+            name: None,
             node,
             ip,
             endpoint: None,
+            candidates: vec![],
         }
     }
 
     pub fn with_endpoint(mut self, endpoint: SocketAddr) -> Peer {
         self.endpoint = Some(endpoint);
         self
+    }
+
+    pub fn with_candidates(mut self, candidates: Vec<SocketAddr>) -> Peer {
+        self.endpoint = self.endpoint.or_else(|| candidates.first().copied());
+        self.candidates = candidates;
+        self
+    }
+
+    /// Everywhere worth trying, best guess first and never empty when we know
+    /// of anywhere at all.
+    pub fn reachable_at(&self) -> Vec<SocketAddr> {
+        let mut all: Vec<SocketAddr> = self.endpoint.into_iter().collect();
+
+        for candidate in &self.candidates {
+            if !all.contains(candidate) {
+                all.push(*candidate);
+            }
+        }
+
+        all
     }
 }
 
@@ -88,6 +119,34 @@ impl Peers {
 
     pub fn remove(&self, node: &NodeId) -> Option<Peer> {
         self.table.lock().unwrap().remove(node)
+    }
+
+    /// Resolve `<name>.smol`, or a bare `<name>`, to a peer's overlay address.
+    /// Matching is case insensitive because dns is.
+    pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
+        let wanted = name.trim_end_matches('.').to_ascii_lowercase();
+        let label = wanted
+            .strip_suffix(&format!(".{ZONE}"))
+            .unwrap_or(&wanted)
+            .to_owned();
+
+        let table = self.table.lock().unwrap();
+
+        table
+            .by_node
+            .values()
+            .find(|peer| peer.name.as_deref() == Some(label.as_str()))
+            .map(|peer| peer.ip)
+    }
+
+    pub fn named(&self) -> Vec<(String, Ipv4Addr)> {
+        let table = self.table.lock().unwrap();
+
+        table
+            .by_node
+            .values()
+            .filter_map(|peer| Some((peer.name.clone()?, peer.ip)))
+            .collect()
     }
 
     pub fn for_ip(&self, ip: &Ipv4Addr) -> Option<Peer> {
@@ -210,6 +269,47 @@ impl std::fmt::Debug for Peers {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn a_name_resolves_with_or_without_the_zone() {
+        use crate::peer::{Peer, Peers};
+        use std::net::Ipv4Addr;
+
+        let peers: Peers = Peers::default();
+
+        let mut laptop = Peer::new(crate::id::NodeId::random(), Ipv4Addr::new(10, 1, 2, 3));
+        laptop.name = Some("laptop".to_owned());
+
+        peers.replace_all([laptop]);
+
+        assert_eq!(peers.resolve("laptop.smol"), Some(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(peers.resolve("laptop"), Some(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(
+            peers.resolve("LAPTOP.SMOL"),
+            Some(Ipv4Addr::new(10, 1, 2, 3)),
+            "dns lookups are case insensitive"
+        );
+        assert_eq!(
+            peers.resolve("laptop.smol."),
+            Some(Ipv4Addr::new(10, 1, 2, 3)),
+            "a fully qualified name ends in a dot"
+        );
+
+        assert_eq!(peers.resolve("desktop.smol"), None);
+        assert_eq!(peers.resolve("laptop.example.com"), None);
+    }
+
+    #[test]
+    fn an_unnamed_peer_is_not_resolvable() {
+        use crate::peer::{Peer, Peers};
+        use std::net::Ipv4Addr;
+
+        let peers: Peers = Peers::default();
+        peers.replace_all([Peer::new(crate::id::NodeId::random(), Ipv4Addr::new(10, 1, 2, 4))]);
+
+        assert!(peers.named().is_empty());
+        assert_eq!(peers.resolve("anything.smol"), None);
+    }
+
     use std::net::{Ipv4Addr, SocketAddr};
 
     use crate::{
@@ -239,6 +339,40 @@ mod test {
 
         assert_eq!(peers.route(&ip), Some(endpoint(4001)));
         assert_eq!(peers.route(&Ipv4Addr::new(10, 30, 0, 9)), None);
+    }
+
+    #[test]
+    fn every_published_address_is_worth_trying() {
+        let peer = Peer::new(NodeId::random(), Ipv4Addr::new(10, 0, 0, 2))
+            .with_candidates(vec![endpoint(4001), endpoint(4002)]);
+
+        assert_eq!(
+            peer.endpoint,
+            Some(endpoint(4001)),
+            "the first published address is the opening guess"
+        );
+        assert_eq!(peer.reachable_at(), vec![endpoint(4001), endpoint(4002)]);
+    }
+
+    #[test]
+    fn the_address_that_answered_is_tried_first_and_only_once() {
+        let mut peer = Peer::new(NodeId::random(), Ipv4Addr::new(10, 0, 0, 2))
+            .with_candidates(vec![endpoint(4001), endpoint(4002)]);
+
+        peer.endpoint = Some(endpoint(4002));
+
+        assert_eq!(
+            peer.reachable_at(),
+            vec![endpoint(4002), endpoint(4001)],
+            "what worked leads, and nothing is asked twice"
+        );
+    }
+
+    #[test]
+    fn a_peer_we_know_nowhere_to_reach_has_nowhere_to_try() {
+        let peer = Peer::new(NodeId::random(), Ipv4Addr::new(10, 0, 0, 2));
+
+        assert!(peer.reachable_at().is_empty());
     }
 
     #[test]

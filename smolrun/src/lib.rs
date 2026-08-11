@@ -26,6 +26,8 @@ pub struct RunConfig {
     pub mac: String,
     pub workdir: Option<std::path::PathBuf>,
     pub allow_io_uring: bool,
+    pub ca: Option<String>,
+    pub keys: Option<smolmesh::keys::Keypair>,
     pub command: Vec<String>,
 }
 
@@ -41,6 +43,8 @@ impl RunConfig {
             mac: "02:de:ad:be:ef:11".to_owned(),
             workdir: None,
             allow_io_uring: false,
+            ca: None,
+            keys: None,
             command,
         }
     }
@@ -172,19 +176,32 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         return Err("no command to run".into());
     }
 
-    let (net, address, netmask) = match (&args.control, &args.token) {
+    let (net, address, netmask, zone) = match (&args.control, &args.token) {
         (Some(control), Some(token)) => {
-            let session = Joined::join(JoinConfig::new(control.clone(), token.clone()))
-                .await?
-                .into_session();
+            let mut joining = JoinConfig::new(control.clone(), token.clone()).ca(args.ca.clone());
+
+            if let Some(keys) = args.keys.clone() {
+                joining = joining.keys(keys);
+            }
+
+            let session = Joined::join(joining).await?.into_session();
 
             let net = session.net();
             let address = session.ipv4_addr();
             let netmask = session.membership().netmask;
 
+            let zone = smolmesh::dns::Zone::new(session.peers()).with_self(
+                session
+                    .membership()
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "this".to_owned()),
+                address,
+            );
+
             tokio::spawn(session.run());
 
-            (net, address, netmask)
+            (net, address, netmask, Some(zone))
         }
         _ => {
             let identity = StackIdentity {
@@ -197,7 +214,7 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
             let (net, driver): (Net, _) = smolnet::net::build(identity, device);
             tokio::spawn(driver.run());
 
-            (net, args.ip, args.netmask)
+            (net, args.ip, args.netmask, None)
         }
     };
 
@@ -212,7 +229,7 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         "supervising, its sockets now live on the smolnet stack"
     );
 
-    let supervisor = Supervisor::new(
+    let mut supervisor = Supervisor::new(
         handover.listener,
         pid,
         net,
@@ -220,6 +237,11 @@ pub async fn run(args: RunConfig) -> Result<(), Box<dyn std::error::Error>> {
         (address, netmask),
         args.allow_io_uring,
     )?;
+
+    if let Some(zone) = zone {
+        supervisor = supervisor.with_resolver(zone);
+    }
+
     std::thread::spawn(move || supervisor.run());
 
     let group = pid as libc::pid_t;

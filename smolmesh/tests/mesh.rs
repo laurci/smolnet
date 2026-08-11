@@ -34,6 +34,10 @@ struct Node {
 }
 
 async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
+    mesh_with(size, None).await
+}
+
+async fn mesh_with(size: usize, rekey: Option<Duration>) -> (NetworkId, Vec<Node>) {
     init_tracing();
 
     let network = NetworkId::random();
@@ -48,9 +52,14 @@ async fn mesh(size: usize) -> (NetworkId, Vec<Node>) {
         let keys = smolmesh::keys::Keypair::generate().unwrap();
         let key = keys.public();
 
-        let (device, handle) = MeshDevice::bind("127.0.0.1:0", &membership, keys)
+        let (mut device, handle) = MeshDevice::bind("127.0.0.1:0", &membership, keys)
             .await
             .unwrap();
+
+        if let Some(after) = rekey {
+            device.rekey_after(after);
+        }
+
         let endpoint = handle.local_addr().unwrap();
 
         let (net, driver) = smolnet::net::build(membership.stack_identity(), device);
@@ -312,6 +321,98 @@ async fn two_nodes_reach_each_other_over_an_encrypted_session() {
 
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_finds_the_candidate_that_answers() {
+    let (_, nodes) = mesh(2).await;
+
+    // Somewhere that takes datagrams and never replies, which is how a peer
+    // behind our own nat looks when we aim at the address stun gave it.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead = blackhole.local_addr().unwrap();
+
+    let peers = nodes[1].handle.peers();
+    let mut peer =
+        Peer::new(nodes[0].id, nodes[0].ip).with_candidates(vec![dead, nodes[0].endpoint]);
+    peer.key = Some(nodes[0].key);
+    peers.insert(peer);
+
+    assert_eq!(
+        peers.route(&nodes[0].ip),
+        Some(dead),
+        "the first candidate is the one we would have used on its own"
+    );
+
+    let listener = nodes[0].net.udp_bind(Some(ECHO_PORT)).unwrap();
+    let sender = nodes[1].net.udp_bind(None).unwrap();
+
+    sender
+        .send_to(b"round the back", nodes[0].ip, ECHO_PORT)
+        .unwrap();
+
+    let mut buf = [0u8; 128];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(10), listener.recv_from(&mut buf))
+        .await
+        .expect("a working candidate carried it")
+        .unwrap();
+
+    assert_eq!(&buf[..len], b"round the back");
+    assert_eq!(
+        peers.route(&nodes[0].ip),
+        Some(nodes[0].endpoint),
+        "and the address that answered is the one we keep"
+    );
+}
+
+/// Sessions are replaced while they are in use, so a peer that restarts is not
+/// stuck behind a session only one side still has. Nothing may be dropped while
+/// that happens.
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_survives_a_session_being_replaced_underneath_it() {
+    let (_, nodes) = mesh_with(2, Some(Duration::from_millis(150))).await;
+
+    let listener = nodes[0].net.udp_bind(Some(ECHO_PORT)).unwrap();
+    let sender = nodes[1].net.udp_bind(None).unwrap();
+
+    const SENT: usize = 40;
+
+    let receiving = tokio::spawn(async move {
+        let mut seen = vec![];
+        let mut buf = [0u8; 128];
+
+        while seen.len() < SENT {
+            let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+
+            seen.push(String::from_utf8_lossy(&buf[..len]).to_string());
+        }
+
+        seen
+    });
+
+    for number in 0..SENT {
+        sender
+            .send_to(format!("packet {number}").as_bytes(), nodes[0].ip, ECHO_PORT)
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let seen = receiving.await.unwrap();
+
+    assert_eq!(
+        seen.len(),
+        SENT,
+        "every packet must arrive across the rekeys, not just the ones between them"
+    );
+
+    for number in 0..SENT {
+        assert!(seen.contains(&format!("packet {number}")), "packet {number} went missing");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_keepalive_teaches_an_endpoint_without_carrying_traffic() {
     let (_, nodes) = mesh(2).await;
 
@@ -470,4 +571,64 @@ async fn a_reflection_for_another_network_is_ignored() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(nodes[0].handle.observed().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resolver_answers_names_from_the_peer_table() {
+    use smolmesh::dns::{Zone, serve};
+    use smolmesh::peer::{Peer, Peers};
+
+    init_tracing();
+
+    let peers: Peers = Peers::default();
+
+    let mut laptop = Peer::new(NodeId::random(), Ipv4Addr::new(10, 9, 8, 7));
+    laptop.name = Some("laptop".to_owned());
+    peers.replace_all([laptop]);
+
+    let zone = Zone::new(peers).with_self("thisbox", Ipv4Addr::new(10, 9, 8, 2));
+
+    let bound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    drop(bound);
+
+    tokio::spawn(async move {
+        let _ = serve(zone, listen).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // a minimal query for laptop.smol A, built by hand so the test does not
+    // depend on the same library it is checking
+    let query: Vec<u8> = {
+        let mut out = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in ["laptop", "smol"] {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        out
+    };
+
+    client.send_to(&query, listen).await.unwrap();
+
+    let mut buf = [0u8; 512];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("the resolver answered")
+        .unwrap();
+
+    let reply = &buf[..len];
+
+    assert_eq!(&reply[..2], &[0x12, 0x34], "the reply carries our query id");
+    assert_eq!(reply[2] & 0x80, 0x80, "it is a response");
+    assert_eq!(reply[3] & 0x0f, 0, "with no error");
+    assert!(u16::from_be_bytes([reply[6], reply[7]]) >= 1, "and at least one answer");
+
+    assert!(
+        reply.windows(4).any(|w| w == [10, 9, 8, 7]),
+        "the answer carries the peer's overlay address"
+    );
 }

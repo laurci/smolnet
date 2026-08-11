@@ -96,7 +96,11 @@ pub struct Holder {
 #[derive(Debug, Clone, Copy)]
 pub enum Wanted<'a> {
     Existing(&'a str),
+    /// An exact name the user asked for: reuse the device that holds it.
     Named(&'a str),
+    /// A name derived from the machine, so only a hint: normalise it and take
+    /// the next free variant rather than colliding with someone else's device.
+    Suggested(&'a str),
     Rename { device: &'a str, name: &'a str },
     Throwaway,
     Fresh,
@@ -131,6 +135,51 @@ fn identifier() -> String {
     rand::fill(&mut bytes);
 
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+const ADJECTIVES: &[&str] = &[
+    "amber", "brisk", "calm", "dusky", "eager", "faint", "gentle", "hazy", "idle", "jolly",
+    "keen", "lively", "mellow", "noble", "olive", "plucky", "quiet", "rapid", "silent", "tidy",
+];
+
+const CREATURES: &[&str] = &[
+    "otter", "badger", "heron", "marten", "finch", "lynx", "vole", "shrike", "gecko", "ibis",
+    "krill", "loon", "mantis", "newt", "osprey", "puffin", "quail", "raven", "stoat", "tapir",
+];
+
+/// A throwaway device still deserves something readable in the console.
+pub fn random_name() -> String {
+    let mut bytes = [0u8; 2];
+    rand::fill(&mut bytes);
+
+    format!(
+        "{}-{}",
+        ADJECTIVES[bytes[0] as usize % ADJECTIVES.len()],
+        CREATURES[bytes[1] as usize % CREATURES.len()]
+    )
+}
+
+/// Names become dns labels, so keep them to what a label may hold: lowercase
+/// alphanumerics and single dashes, never leading or trailing.
+pub fn normalize(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.push(character.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    let capped: String = trimmed.chars().take(63).collect();
+
+    if capped.is_empty() {
+        random_name()
+    } else {
+        capped.trim_matches('-').to_owned()
+    }
 }
 
 fn random_subnet() -> Ipv4Addr {
@@ -375,6 +424,29 @@ impl Store {
                 }
             }
 
+            Wanted::Suggested(name) => {
+                let wanted = normalize(name);
+                let taken: Vec<String> =
+                    sqlx::query("SELECT name FROM devices WHERE network = ?1 AND name IS NOT NULL")
+                        .bind(network)
+                        .fetch_all(&self.pool)
+                        .await?
+                        .into_iter()
+                        .map(|row| row.get(0))
+                        .collect();
+
+                let mut candidate = wanted.clone();
+                let mut suffix = 1;
+
+                while taken.contains(&candidate) {
+                    candidate = format!("{wanted}-{suffix}");
+                    suffix += 1;
+                }
+
+                self.insert_device(owner, network, Some(&candidate), false)
+                    .await?
+            }
+
             Wanted::Named(name) => {
                 let existing: Option<String> =
                     sqlx::query("SELECT id FROM devices WHERE network = ?1 AND name = ?2")
@@ -390,7 +462,27 @@ impl Store {
                 }
             }
 
-            Wanted::Throwaway => self.insert_device(owner, network, None, true).await?,
+            Wanted::Throwaway => {
+                let taken: Vec<String> =
+                    sqlx::query("SELECT name FROM devices WHERE network = ?1 AND name IS NOT NULL")
+                        .bind(network)
+                        .fetch_all(&self.pool)
+                        .await?
+                        .into_iter()
+                        .map(|row| row.get(0))
+                        .collect();
+
+                let mut candidate = random_name();
+                let mut suffix = 1;
+
+                while taken.contains(&candidate) {
+                    candidate = format!("{}-{suffix}", random_name());
+                    suffix += 1;
+                }
+
+                self.insert_device(owner, network, Some(&candidate), true)
+                    .await?
+            }
 
             Wanted::Fresh => self.insert_device(owner, network, None, false).await?,
         };
@@ -974,6 +1066,85 @@ mod test {
             1,
             "renaming must not leave the old device behind"
         );
+    }
+
+    #[tokio::test]
+    async fn a_suggested_name_is_normalised_into_a_dns_label() {
+        use crate::server::store::normalize;
+
+        assert_eq!(normalize("Laurentius-MacBook-Pro"), "laurentius-macbook-pro");
+        assert_eq!(normalize("alpha1.lttle.cloud"), "alpha1-lttle-cloud");
+        assert_eq!(normalize("  spaces   here  "), "spaces-here");
+        assert_eq!(normalize("--weird--"), "weird");
+        assert!(!normalize("!!!").is_empty(), "a name of only junk still gets one");
+        assert!(normalize(&"x".repeat(200)).len() <= 63, "labels are capped");
+    }
+
+    #[tokio::test]
+    async fn a_suggested_name_steps_aside_rather_than_stealing_one() {
+        let store = store().await;
+        let owner = owner(&store).await;
+        let network = network(&store, &owner).await;
+
+        let first = store
+            .resolve_device(&owner, &network, Wanted::Suggested("laptop"), "node-a")
+            .await
+            .unwrap();
+        let second = store
+            .resolve_device(&owner, &network, Wanted::Suggested("Laptop"), "node-b")
+            .await
+            .unwrap();
+        let third = store
+            .resolve_device(&owner, &network, Wanted::Suggested("laptop"), "node-c")
+            .await
+            .unwrap();
+
+        assert_eq!(first.name.as_deref(), Some("laptop"));
+        assert_eq!(second.name.as_deref(), Some("laptop-1"), "same name after normalising");
+        assert_eq!(third.name.as_deref(), Some("laptop-2"));
+
+        assert_ne!(first.id, second.id, "a suggestion never takes over a device");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_name_reuses_the_device_instead_of_stepping_aside() {
+        let store = store().await;
+        let owner = owner(&store).await;
+        let network = network(&store, &owner).await;
+
+        let first = store
+            .resolve_device(&owner, &network, Wanted::Named("minecraft"), "node-a")
+            .await
+            .unwrap();
+        let again = store
+            .resolve_device(&owner, &network, Wanted::Named("minecraft"), "node-b")
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, again.id, "asking for a name by hand means that device");
+        assert_eq!(again.name.as_deref(), Some("minecraft"));
+        assert_eq!(store.devices(&owner).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_throwaway_still_gets_a_readable_unique_name() {
+        let store = store().await;
+        let owner = owner(&store).await;
+        let network = network(&store, &owner).await;
+
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..20 {
+            let device = store
+                .resolve_device(&owner, &network, Wanted::Throwaway, "node")
+                .await
+                .unwrap();
+
+            let name = device.name.expect("a throwaway is still nameable");
+
+            assert!(name.contains('-'), "expected adjective-creature, got {name}");
+            assert!(seen.insert(name), "throwaway names must not collide");
+        }
     }
 
     #[tokio::test]

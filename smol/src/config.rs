@@ -1,7 +1,9 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use smolmesh::keys::Keypair;
 
 pub const SYSTEM_DIR: &str = "/etc/smol";
 
@@ -31,8 +33,11 @@ impl Config {
         format!("# written by smol; edit if you know what you are doing\n{body}")
     }
 
+    /// The control port always speaks tls. The certificate is the server's
+    /// own, so what makes it trustworthy is the copy handed over the console's
+    /// https api at the same time as the join token.
     pub fn mesh_url(&self) -> Option<String> {
-        (!self.mesh.is_empty()).then(|| format!("http://{}", self.mesh))
+        (!self.mesh.is_empty()).then(|| format!("https://{}", self.mesh))
     }
 
     pub fn device(&self) -> Option<&str> {
@@ -77,6 +82,57 @@ pub fn system_path() -> PathBuf {
 
 pub fn daemon_path() -> PathBuf {
     PathBuf::from(SYSTEM_DIR).join("daemon.toml")
+}
+
+/// Where a device's long term mesh key lives. The daemon keeps its keys under
+/// /etc so it does not depend on any one user's home directory being readable
+/// at boot; everything a person runs keeps them beside their own config.
+pub fn keys_dir(system: bool) -> PathBuf {
+    if system {
+        return PathBuf::from(SYSTEM_DIR).join("keys");
+    }
+
+    match home() {
+        Some(home) => home.join(".config/smol/keys"),
+        None => PathBuf::from(SYSTEM_DIR).join("keys"),
+    }
+}
+
+/// The key pair that identifies a device on the mesh, made once and then kept.
+///
+/// It is per device rather than per machine on purpose: a peer is looked up by
+/// its public key when a packet is opened, so two devices sharing one key would
+/// be indistinguishable to everyone else, and traffic from one would be
+/// attributed to the other.
+pub fn keys_for(system: bool, device: &str) -> Result<Keypair, Box<dyn Error>> {
+    keys_in(&keys_dir(system), device)
+}
+
+pub fn keys_in(directory: &Path, device: &str) -> Result<Keypair, Box<dyn Error>> {
+    let path = directory.join(format!("{device}.key"));
+
+    if let Ok(stored) = std::fs::read_to_string(&path) {
+        match Keypair::from_hex(stored.trim()) {
+            Ok(keys) => return Ok(keys),
+            Err(e) => tracing::warn!(path = %path.display(), "replacing an unreadable key: {e}"),
+        }
+    }
+
+    let keys = Keypair::generate()?;
+
+    std::fs::create_dir_all(directory)?;
+    write_private(&path, &keys.private_hex())?;
+
+    tracing::info!(device, path = %path.display(), "kept a new mesh key for this device");
+
+    Ok(keys)
+}
+
+fn write_private(path: &PathBuf, contents: &str) -> Result<(), Box<dyn Error>> {
+    std::fs::write(path, contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(())
 }
 
 impl Config {
@@ -157,7 +213,9 @@ pub fn resolve(control: Option<String>, key: Option<String>) -> Result<Config, B
 
 #[cfg(test)]
 mod test {
-    use crate::config::Config;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::config::{Config, keys_in};
 
     #[test]
     fn a_config_round_trips_through_toml() {
@@ -171,8 +229,50 @@ mod test {
         let parsed = Config::parse(&config.render()).unwrap();
 
         assert_eq!(parsed, config);
-        assert_eq!(parsed.mesh_url().as_deref(), Some("http://example.com:54189"));
+        assert_eq!(
+            parsed.mesh_url().as_deref(),
+            Some("https://example.com:54189"),
+            "the control port is never dialled in the clear"
+        );
         assert_eq!(parsed.device(), Some("dev123"));
+    }
+
+    #[test]
+    fn a_device_keeps_the_same_key_across_restarts() {
+        let home = std::env::temp_dir().join(format!("smol-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+
+        let first = keys_in(&home, "dev123").unwrap();
+        let again = keys_in(&home, "dev123").unwrap();
+
+        assert_eq!(
+            first.public(),
+            again.public(),
+            "a restart must not change who this device is on the mesh"
+        );
+
+        // Two devices on one machine are two identities: peers are looked up by
+        // public key, so sharing one would make their traffic indistinguishable.
+        let other = keys_in(&home, "dev456").unwrap();
+
+        assert_ne!(first.public(), other.public());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_stored_key_is_readable_only_by_its_owner() {
+        let home = std::env::temp_dir().join(format!("smol-keyperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+
+        keys_in(&home, "dev789").unwrap();
+
+        let path = home.join("dev789.key");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+
+        assert_eq!(mode & 0o077, 0, "nobody else may read a device's private key");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

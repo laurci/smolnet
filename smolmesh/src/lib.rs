@@ -1,4 +1,5 @@
 pub mod device;
+pub mod dns;
 pub mod forward;
 pub mod id;
 pub mod keys;

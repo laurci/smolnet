@@ -208,6 +208,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let account = smolctl::client::verify(&control, &key).await?;
 
+            let chosen = args.name.is_some();
+
             let name = args
                 .name
                 .or_else(smolctl::client::discovered_hostname)
@@ -221,6 +223,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &node,
                 config.device(),
                 Some(&name),
+                chosen,
                 false,
             )
             .await?;
@@ -295,6 +298,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &node_id,
                 config.device(),
                 args.name.as_deref(),
+                true,
                 false,
             )
             .await?;
@@ -307,6 +311,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let mut node = smolnode::NodeConfig::new(mesh, issued.token);
 
+            node.ca = issued.ca;
+            node.keys = Some(config::keys_for(true, &issued.device)?);
             node.bind = args.bind;
             node.interface = args.interface;
             node.mtu = args.mtu;
@@ -339,6 +345,7 @@ async fn run_program(args: Run) -> Result<(), Box<dyn Error>> {
         &node_id,
         None,
         args.name.as_deref(),
+        true,
         ephemeral,
     )
     .await?;
@@ -358,6 +365,13 @@ async fn run_program(args: Run) -> Result<(), Box<dyn Error>> {
 
     run.control = Some(mesh);
     run.token = Some(issued.token);
+    run.ca = issued.ca;
+
+    // A throwaway device is gone the moment this exits, so its key has nothing
+    // to outlive; a named one is the same device every run and keeps its own.
+    if !ephemeral {
+        run.keys = Some(config::keys_for(false, &issued.device)?);
+    }
     run.workdir = args.workdir;
     run.allow_io_uring = args.allow_io_uring;
 

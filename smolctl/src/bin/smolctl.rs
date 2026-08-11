@@ -8,7 +8,7 @@ use smolctl::{
     token::{self, DEFAULT_TTL, Identity},
 };
 use smolmesh::{NetworkId, NodeId, Reflector};
-use tonic::transport::Server;
+use tonic::transport::{Server, ServerTlsConfig};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -128,6 +128,8 @@ async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
         Err(e) => tracing::warn!("could not clear stale presence: {e}"),
     }
 
+    let material = smolctl::server::tls::Material::load_or_create(beside(&args.database))?;
+
     let (console, presence) = smolctl::server::http::Console::new(
         store.clone(),
         secret.clone(),
@@ -135,6 +137,7 @@ async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
         std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
         std::env::var("SMOL_PUBLIC_URL").unwrap_or_else(|_| format!("http://{}", args.console)),
         args.assets.clone().map(std::path::PathBuf::from),
+        material.certificate.clone(),
     );
 
     {
@@ -166,10 +169,18 @@ async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
         advertise = %args.advertise,
         subnet = %args.subnet,
         netmask = %args.netmask,
+        certificate = %material.fingerprint(),
         "control server starting"
     );
 
     Server::builder()
+        .tls_config(ServerTlsConfig::new().identity(material.identity()))?
+        // Nodes hold this stream open for days behind home routers. Ping it so
+        // a connection the network quietly dropped is noticed on both ends
+        // instead of leaving a node listed as online long after it is gone.
+        .http2_keepalive_interval(Some(smolctl::client::CONTROL_KEEPALIVE))
+        .http2_keepalive_timeout(Some(smolctl::client::CONTROL_KEEPALIVE_TIMEOUT))
+        .tcp_keepalive(Some(smolctl::client::CONTROL_KEEPALIVE))
         .add_service(service.into_server())
         .serve_with_shutdown(args.listen, async {
             let _ = tokio::signal::ctrl_c().await;
@@ -178,6 +189,17 @@ async fn serve(cli: &Cli, args: &Serve) -> Result<(), Box<dyn Error>> {
         .await?;
 
     Ok(())
+}
+
+/// Keep the control certificate next to the database: both are this server's
+/// state, and both have to outlive a restart.
+fn beside(database: &str) -> &std::path::Path {
+    let parent = std::path::Path::new(database).parent();
+
+    match parent {
+        Some(directory) if !directory.as_os_str().is_empty() => directory,
+        _ => std::path::Path::new("."),
+    }
 }
 
 fn network(args: &Network) {

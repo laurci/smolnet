@@ -1,6 +1,7 @@
 pub mod http;
 pub mod registry;
 pub mod store;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -22,6 +23,9 @@ use crate::{
 };
 
 const STREAM_CAPACITY: usize = 64;
+
+/// The top level domain every device answers under: <name>.smol
+pub const ZONE: &str = "smol";
 
 pub struct ControlService {
     registry: Registry,
@@ -92,6 +96,7 @@ impl Control for ControlService {
         let remote = request.remote_addr();
 
         let mut advertised = None;
+        let mut named = None;
 
         let leased = match &self.store {
             Some(store) => {
@@ -116,6 +121,7 @@ impl Control for ControlService {
                 }
 
                 advertised = device.public_key.clone();
+                named = device.name.clone();
 
                 Some(device.ip)
             }
@@ -129,6 +135,7 @@ impl Control for ControlService {
                 identity.node,
                 leased,
                 advertised,
+                named.clone(),
                 STREAM_CAPACITY,
             )
             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
@@ -151,6 +158,8 @@ impl Control for ControlService {
                 peers: joined.peers,
                 device: identity.device.clone(),
                 hostname: String::new(),
+                name: named.clone().unwrap_or_default(),
+                zone: ZONE.to_owned(),
             })),
         };
 

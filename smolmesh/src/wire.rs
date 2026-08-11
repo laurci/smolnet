@@ -16,6 +16,10 @@ pub const DATA_HEADER_SIZE: usize = 14;
 /// and `MessageType` cannot name it.
 pub const DATA_CODE: u8 = 1;
 
+/// The sealed form has to cost less on the wire than the plaintext header it
+/// replaced, even carrying an authentication tag.
+const _: () = assert!(DATA_HEADER_SIZE + 16 < HEADER_SIZE);
+
 const INDEX_OFFSET: usize = 2;
 const COUNTER_OFFSET: usize = 6;
 
@@ -369,8 +373,7 @@ impl<'a> Sealed<'a> {
 
 #[cfg(test)]
 mod sealed_test {
-    use crate::wire::{
-        DATA_CODE,DATA_HEADER_SIZE, HEADER_SIZE, MESH_VERSION, MessageType, Sealed};
+    use crate::wire::{DATA_HEADER_SIZE, MESH_VERSION, MessageType, Sealed};
 
     #[test]
     fn an_encrypted_header_round_trips() {
@@ -384,14 +387,6 @@ mod sealed_test {
         assert_eq!(parsed.index, 0xdead_beef);
         assert_eq!(parsed.counter, 0x0102_0304_0506_0708);
         assert_eq!(parsed.ciphertext, b"body");
-    }
-
-    #[test]
-    fn an_encrypted_packet_is_smaller_than_the_plaintext_one_was() {
-        assert!(
-            DATA_HEADER_SIZE + 16 < HEADER_SIZE,
-            "30 bytes of header and tag must still beat the old {HEADER_SIZE} byte header"
-        );
     }
 
     #[test]

@@ -5,10 +5,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use smolmesh::dns::Zone;
 use smolnet::net::{Net, tcp::TcpStream, udp::UdpSocket};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::mem::Memory;
 use crate::notify::{self, ADDFD_FLAG_SEND, ADDFD_FLAG_SETFD, Notif, NotifAddfd};
@@ -28,6 +29,8 @@ const IOVEC_SIZE: u64 = 16;
 const IOV_MAX: usize = 1024;
 const MSG_TRUNC_FLAG: u32 = 0x20;
 const CLOSE_RANGE_CLOEXEC: u64 = 4;
+const DNS_PORT: u16 = 53;
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 type Arrival = (TcpStream, SocketAddrV4);
@@ -37,6 +40,10 @@ type Datagram = (Vec<u8>, SocketAddrV4);
 struct Bound {
     socket: Arc<UdpSocket>,
     inbox: UnboundedReceiver<Datagram>,
+    /// The other end of the inbox, so the supervisor can put a datagram the
+    /// target never sent for onto the socket.
+    injector: UnboundedSender<Datagram>,
+    bell: OwnedFd,
     peeked: Option<Datagram>,
     drain: OwnedFd,
     receiving: tokio::task::AbortHandle,
@@ -197,6 +204,7 @@ pub struct Supervisor {
     group: u32,
     allow_rings: bool,
     warned_rings: bool,
+    zone: Option<Zone>,
 }
 
 fn socketpair(kind: libc::c_int) -> io::Result<(OwnedFd, OwnedFd)> {
@@ -332,11 +340,20 @@ impl Supervisor {
             group: pid,
             allow_rings,
             warned_rings: false,
+            zone: None,
         };
 
         supervisor.watch(pid);
 
         Ok(supervisor)
+    }
+
+    /// Give the target a resolver of its own. Without one its dns leaves as any
+    /// other off overlay traffic does, which only reaches mesh names when the
+    /// machine already runs the daemon.
+    pub fn with_resolver(mut self, zone: Zone) -> Supervisor {
+        self.zone = Some(zone);
+        self
     }
 
     fn watch(&mut self, pid: u32) {
@@ -697,6 +714,100 @@ impl Supervisor {
         Ok(Answer::Continue)
     }
 
+    /// The target's resolver traffic never reaches a real name server. Names in
+    /// our zone are answered from the peer table; everything else is asked on
+    /// the target's behalf and handed back on the same socket.
+    ///
+    /// Handing over a kernel socket would be simpler, but it gives the target a
+    /// new file description behind the same descriptor, and anything that had
+    /// already registered the old one with epoll would never hear from it again.
+    fn intercept_dns(
+        &mut self,
+        fd: i32,
+        payload: &[u8],
+        server: SocketAddrV4,
+    ) -> io::Result<Option<Answer>> {
+        if server.port() != DNS_PORT {
+            return Ok(None);
+        }
+
+        let Some(zone) = self.zone.clone() else {
+            return Ok(None);
+        };
+
+        let sent = Answer::Value(payload.len() as i64);
+
+        if let Some(reply) = zone.answer(payload) {
+            tracing::debug!(fd, %server, "answered a query from the peer table");
+
+            self.deliver(fd, reply, server)?;
+
+            return Ok(Some(sent));
+        }
+
+        self.forward_query(fd, payload.to_vec(), server)?;
+
+        Ok(Some(sent))
+    }
+
+    /// Put a datagram on a socket as though it had arrived from `from`.
+    fn deliver(&mut self, fd: i32, payload: Vec<u8>, from: SocketAddrV4) -> io::Result<()> {
+        let Some(bound) = self.datagram_socket(fd)? else {
+            return Err(io::Error::other("the socket went away"));
+        };
+
+        if bound.injector.send((payload, from)).is_err() {
+            return Err(io::Error::other("nothing is left to read the socket"));
+        }
+
+        ring(bound.bell.as_fd());
+
+        Ok(())
+    }
+
+    /// Ask the name server the target chose, from the host's network, and put
+    /// the reply on the target's socket when it comes.
+    fn forward_query(&mut self, fd: i32, query: Vec<u8>, server: SocketAddrV4) -> io::Result<()> {
+        let Some(bound) = self.datagram_socket(fd)? else {
+            return Err(io::Error::other("the socket went away"));
+        };
+
+        let injector = bound.injector.clone();
+        let bell = bound.bell.try_clone()?;
+        let nudge = self.waker.try_clone()?;
+
+        self.runtime.spawn(async move {
+            let asked = async {
+                let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+
+                socket.send_to(&query, server).await?;
+
+                let mut buffer = vec![0u8; 65_536];
+                let (len, _) = socket.recv_from(&mut buffer).await?;
+
+                buffer.truncate(len);
+
+                Ok::<Vec<u8>, io::Error>(buffer)
+            };
+
+            match tokio::time::timeout(DNS_TIMEOUT, asked).await {
+                Ok(Ok(reply)) => {
+                    if injector.send((reply, server)).is_ok() {
+                        ring(bell.as_fd());
+                        nudge.wake();
+                    }
+                }
+
+                // Saying nothing is what a lost datagram looks like, which every
+                // resolver already knows how to retry.
+                Ok(Err(e)) => tracing::debug!(%server, "could not reach the name server: {e}"),
+                Err(_) => tracing::debug!(%server, "the name server did not answer"),
+            }
+        });
+
+        Ok(())
+    }
+
     fn is_blocking(&self, fd: i32) -> bool {
         if let Some(socket) = self.sockets.get(&fd)
             && socket.observed_flags
@@ -996,7 +1107,9 @@ impl Supervisor {
 
         let (arrived, inbox) = unbounded_channel();
         let bell = entry.ours.as_ref().unwrap().try_clone()?;
+        let doorbell = entry.ours.as_ref().unwrap().try_clone()?;
         let drain = entry.theirs.as_ref().unwrap().try_clone()?;
+        let injector = arrived.clone();
         let receiver = socket.clone();
 
         let nudge = self.waker.try_clone()?;
@@ -1024,6 +1137,8 @@ impl Supervisor {
         entry.role = Role::Datagram(Some(Bound {
             socket,
             inbox,
+            injector,
+            bell: doorbell,
             peeked: None,
             drain,
             receiving,
@@ -1194,6 +1309,10 @@ impl Supervisor {
                 None => return Ok(Answer::Error(libc::EDESTADDRREQ)),
             }
         };
+
+        if let Some(answer) = self.intercept_dns(fd, &payload, destination)? {
+            return Ok(answer);
+        }
 
         if !self.is_ours(*destination.ip()) {
             return self.hand_back(id, fd, libc::SOCK_DGRAM);
@@ -1406,6 +1525,10 @@ impl Supervisor {
                 None => return Ok(Answer::Error(libc::EDESTADDRREQ)),
             }
         };
+
+        if let Some(answer) = self.intercept_dns(fd, &payload, destination)? {
+            return Ok(answer);
+        }
 
         if !self.is_ours(*destination.ip()) {
             return self.hand_back(id, fd, libc::SOCK_DGRAM);
@@ -1782,7 +1905,12 @@ fn on_connect(&mut self, id: u64, args: [u64; 6]) -> io::Result<Answer> {
             Some(Role::Datagram(_))
         );
 
-        if !self.is_ours(*remote.ip()) {
+        // A resolver usually connects its socket before it sends, and the name
+        // server it connects to is off the overlay. Keep the socket ours so the
+        // query still reaches the peer table.
+        let resolving = datagram && remote.port() == DNS_PORT && self.zone.is_some();
+
+        if !resolving && !self.is_ours(*remote.ip()) {
             let kind = if datagram {
                 libc::SOCK_DGRAM
             } else {

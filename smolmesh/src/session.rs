@@ -11,6 +11,11 @@ use crate::replay::ReplayWindow;
 pub const REKEY_AFTER: Duration = Duration::from_secs(120);
 pub const REKEY_AFTER_MESSAGES: u64 = 1 << 40;
 
+/// A replaced session is kept, unusable for sending, just long enough for the
+/// packets already in flight under it to still open. Without this every rekey
+/// would cost a round trip of dropped traffic.
+pub const REKEY_GRACE: Duration = Duration::from_secs(15);
+
 /// A handshake that gets no answer is retried; give up long before a peer that
 /// is simply gone can hold a slot forever.
 pub const HANDSHAKE_RETRY: Duration = Duration::from_secs(2);
@@ -126,8 +131,8 @@ impl Session {
         self.remote_index
     }
 
-    pub fn stale(&self) -> bool {
-        self.opened.elapsed() > REKEY_AFTER || self.sending > REKEY_AFTER_MESSAGES
+    pub fn stale(&self, after: Duration) -> bool {
+        self.opened.elapsed() > after || self.sending > REKEY_AFTER_MESSAGES
     }
 
     /// Encrypt one packet, returning the counter that must travel with it.
@@ -429,6 +434,10 @@ pub struct Sessions {
     live: HashMap<u32, Session>,
     by_peer: HashMap<PublicKey, u32>,
     pending: HashMap<PublicKey, Pending>,
+    /// The one session per peer that was just replaced, and when. It still
+    /// opens packets until its grace is up; it is simply never sealed with.
+    retired: HashMap<PublicKey, (u32, Instant)>,
+    rekey_after: Duration,
 }
 
 impl Sessions {
@@ -438,7 +447,29 @@ impl Sessions {
             live: HashMap::new(),
             by_peer: HashMap::new(),
             pending: HashMap::new(),
+            retired: HashMap::new(),
+            rekey_after: REKEY_AFTER,
         }
+    }
+
+    /// Shorten the life of a session. Only worth changing to watch a rekey
+    /// happen without waiting minutes for it.
+    pub fn rekey_after(&mut self, after: Duration) {
+        self.rekey_after = after;
+    }
+
+    /// Whether it is time to ask this peer for a fresh session. The current one
+    /// keeps carrying traffic until the new one is answered, so this never
+    /// interrupts anything.
+    pub fn needs_rekey(&mut self, peer: &PublicKey) -> bool {
+        if self.pending.contains_key(peer) {
+            return false;
+        }
+
+        let after = self.rekey_after;
+
+        self.established(peer)
+            .is_some_and(|session| session.stale(after))
     }
 
     pub fn public(&self) -> PublicKey {
@@ -539,8 +570,30 @@ impl Sessions {
     }
 
     fn retire(&mut self, peer: &PublicKey) {
-        if let Some(old) = self.by_peer.remove(peer) {
-            self.live.remove(&old);
+        if let Some(old) = self.by_peer.remove(peer)
+            && let Some((older, _)) = self.retired.insert(*peer, (old, Instant::now()))
+        {
+            // Only ever one previous session per peer, so a burst of rekeys
+            // cannot grow the table.
+            self.live.remove(&older);
+        }
+
+        self.sweep();
+    }
+
+    /// Drop a retired session once nothing sent under it could still arrive.
+    fn sweep(&mut self) {
+        let done: Vec<PublicKey> = self
+            .retired
+            .iter()
+            .filter(|(_, (_, since))| since.elapsed() > REKEY_GRACE)
+            .map(|(peer, _)| *peer)
+            .collect();
+
+        for peer in done {
+            if let Some((index, _)) = self.retired.remove(&peer) {
+                self.live.remove(&index);
+            }
         }
     }
 
@@ -555,6 +608,8 @@ impl Sessions {
 
 #[cfg(test)]
 mod table_test {
+    use std::time::Duration;
+
     use crate::keys::Keypair;
     use crate::session::Sessions;
 
@@ -603,8 +658,90 @@ mod table_test {
             assert!(on_alice.on_reply(bob.public(), &reply, bob_index));
         }
 
-        assert_eq!(on_alice.count(), 1, "rekeying must not pile up sessions");
-        assert_eq!(on_bob.count(), 1);
+        // The current session, plus the one it replaced held briefly so packets
+        // already in flight still open. Never more, however often we rekey.
+        assert_eq!(on_alice.count(), 2, "rekeying must not pile up sessions");
+        assert_eq!(on_bob.count(), 2);
+    }
+
+    #[test]
+    fn a_session_past_its_life_asks_for_a_replacement() {
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap();
+
+        let mut on_alice = Sessions::new(alice);
+        let mut on_bob = Sessions::new(bob.clone());
+
+        on_alice.rekey_after(Duration::from_millis(50));
+
+        let (alice_index, initiation) = on_alice.begin(bob.public()).unwrap();
+        let (bob_index, reply) = on_bob.on_initiation(&initiation, alice_index).unwrap();
+        assert!(on_alice.on_reply(bob.public(), &reply, bob_index));
+
+        assert!(
+            !on_alice.needs_rekey(&bob.public()),
+            "a session just made is not due"
+        );
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert!(on_alice.needs_rekey(&bob.public()), "and an old one is");
+
+        on_alice.begin(bob.public()).unwrap();
+
+        assert!(
+            !on_alice.needs_rekey(&bob.public()),
+            "asking once is enough while the answer is outstanding"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_never_rekeys_is_never_bothered() {
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap();
+
+        let mut on_alice = Sessions::new(alice);
+
+        assert!(
+            !on_alice.needs_rekey(&bob.public()),
+            "a peer with no session at all is handled by the handshake path"
+        );
+    }
+
+    #[test]
+    fn the_replaced_session_still_opens_what_was_already_in_flight() {
+        let alice = Keypair::generate().unwrap();
+        let bob = Keypair::generate().unwrap();
+
+        let mut on_alice = Sessions::new(alice.clone());
+        let mut on_bob = Sessions::new(bob.clone());
+
+        let (alice_index, initiation) = on_alice.begin(bob.public()).unwrap();
+        let (bob_index, reply) = on_bob.on_initiation(&initiation, alice_index).unwrap();
+        assert!(on_alice.on_reply(bob.public(), &reply, bob_index));
+
+        // A packet leaves under the session bob is about to replace.
+        let mut sealed = [0u8; 128];
+        let (counter, len) = on_alice
+            .established(&bob.public())
+            .unwrap()
+            .seal(b"already on the wire", &mut sealed)
+            .unwrap();
+
+        let (second, initiation) = on_alice.begin(bob.public()).unwrap();
+        let (bob_next, reply) = on_bob.on_initiation(&initiation, second).unwrap();
+        assert!(on_alice.on_reply(bob.public(), &reply, bob_next));
+
+        assert_ne!(bob_index, bob_next, "the replacement is a different session");
+
+        let mut out = [0u8; 128];
+        let read = on_bob
+            .by_index(bob_index)
+            .expect("the replaced session is still there for its grace")
+            .open(counter, &sealed[..len], &mut out)
+            .expect("and still opens what was sent under it");
+
+        assert_eq!(&out[..read], b"already on the wire");
     }
 
     #[test]

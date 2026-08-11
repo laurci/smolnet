@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::metadata::MetadataValue;
-use tonic::transport::Endpoint;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tonic::{Request, Streaming};
 
 use crate::proto::{
@@ -35,6 +35,10 @@ pub struct JoinConfig {
     pub hostname: Option<String>,
     pub version: Option<String>,
     pub keys: Option<Keypair>,
+    /// The control port's certificate, learned over the console's https api.
+    /// With one, that certificate is the only one this node will accept; with
+    /// none, an https control url is checked against the usual public roots.
+    pub ca: Option<String>,
 }
 
 fn plausible(name: String) -> Option<String> {
@@ -143,7 +147,13 @@ impl JoinConfig {
             hostname: None,
             version: None,
             keys: None,
+            ca: None,
         }
+    }
+
+    pub fn ca(mut self, ca: Option<String>) -> JoinConfig {
+        self.ca = ca;
+        self
     }
 
     /// A binary mode device passes the key pair it keeps beside its device id;
@@ -179,8 +189,32 @@ impl JoinConfig {
 async fn dial(
     config: &JoinConfig,
 ) -> Result<(mpsc::Sender<ClientMessage>, Streaming<ServerMessage>), JoinError> {
-    let endpoint = Endpoint::from_shared(config.control.clone())
-        .map_err(|_| JoinError::Endpoint(config.control.clone()))?;
+    let mut endpoint = Endpoint::from_shared(config.control.clone())
+        .map_err(|_| JoinError::Endpoint(config.control.clone()))?
+        // A nat that forgets the connection leaves the stream half open: the
+        // server is gone but nothing ever arrives to say so, and a node can sit
+        // for hours believing it is still on the roster. Ping often enough to
+        // turn that silence into an error the reconnect loop can act on.
+        .http2_keep_alive_interval(CONTROL_KEEPALIVE)
+        .keep_alive_timeout(CONTROL_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(CONTROL_KEEPALIVE));
+
+    if config.control.starts_with("https://") {
+        let mut tls = ClientTlsConfig::new().with_enabled_roots();
+
+        if let Some(pem) = &config.ca {
+            // The server signs for itself, so the only thing that makes this
+            // connection meaningful is that the certificate is byte for byte
+            // the one the console handed us. The name in it is a fixed label,
+            // not a claim about the host.
+            tls = ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(pem))
+                .domain_name(crate::server::tls::CONTROL_NAME);
+        }
+
+        endpoint = endpoint.tls_config(tls).map_err(JoinError::Connect)?;
+    }
 
     let channel = endpoint.connect().await.map_err(JoinError::Connect)?;
     let mut client = ControlClient::new(channel);
@@ -253,6 +287,12 @@ pub enum JoinError {
     #[error("the bearer token is not valid metadata")]
     Token,
 }
+
+/// How often to ping the control server over an idle stream.
+pub const CONTROL_KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// How long a ping may go unanswered before the stream counts as gone.
+pub const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
@@ -431,9 +471,13 @@ impl Joined {
             }
         }
 
-        let membership = Membership::new(network, node, ip)
+        let mut membership = Membership::new(network, node, ip)
             .with_netmask(netmask)
             .with_peers(roster);
+
+        if !welcome.name.is_empty() {
+            membership = membership.with_name(welcome.name.clone());
+        }
 
         tracing::info!(
             %network,
@@ -481,6 +525,48 @@ pub struct Session {
 }
 
 impl Session {
+    /// Resolve a name against the mesh. Only `.smol` names and bare peer names
+    /// live here; anything else belongs to the host's resolver.
+    pub fn resolve(&self, name: &str) -> Option<Ipv4Addr> {
+        self.peers.resolve(name)
+    }
+
+    /// Connect to `host:port`. A peer is dialled over the overlay; anything else
+    /// falls back to the host's own network, since the mesh has no route off
+    /// itself yet.
+    pub async fn connect(&self, target: &str) -> std::io::Result<Stream> {
+        let (host, port) = split_target(target)
+            .ok_or_else(|| std::io::Error::other(format!("{target} is not host:port")))?;
+
+        if let Some(ip) = self.peers.resolve(host) {
+            tracing::debug!(host, %ip, "connecting over the mesh");
+
+            return self
+                .net
+                .tcp_connect(ip, port)
+                .await
+                .map(Stream::Mesh)
+                .map_err(|e| std::io::Error::other(e.to_string()));
+        }
+
+        if let Ok(ip) = host.parse::<Ipv4Addr>()
+            && self.peers.for_ip(&ip).is_some()
+        {
+            return self
+                .net
+                .tcp_connect(ip, port)
+                .await
+                .map(Stream::Mesh)
+                .map_err(|e| std::io::Error::other(e.to_string()));
+        }
+
+        tracing::debug!(host, "not on the mesh, dialling with host networking");
+
+        tokio::net::TcpStream::connect((host, port))
+            .await
+            .map(Stream::Host)
+    }
+
     pub async fn join(config: JoinConfig) -> Result<Session, JoinError> {
         Joined::join(config).await.map(Joined::into_session)
     }
@@ -531,13 +617,13 @@ fn decode_peer(state: &crate::proto::PeerState) -> Option<(Peer, Vec<SocketAddr>
         .filter_map(|endpoint| endpoint.parse().ok())
         .collect();
 
-    let mut peer = Peer::new(node, ip);
-    peer.endpoint = endpoints.first().copied();
+    let mut peer = Peer::new(node, ip).with_candidates(endpoints.clone());
 
     // Without the peer's static key there is no way to encrypt to it, and there
     // is no plaintext fallback, so a peer that has not published one is simply
     // unreachable until it does.
     peer.key = state.public_key.parse().ok();
+    peer.name = (!state.name.is_empty()).then(|| state.name.clone());
 
     if peer.key.is_none() && !state.public_key.is_empty() {
         tracing::warn!(node = state.node, "peer published an unreadable public key");
@@ -710,6 +796,7 @@ pub struct Issued {
     pub token: String,
     pub device: String,
     pub ip: String,
+    pub ca: Option<String>,
 }
 
 pub async fn exchange(
@@ -718,11 +805,15 @@ pub async fn exchange(
     node: &str,
     device: Option<&str>,
     name: Option<&str>,
+    // exact: the caller named the device by hand. A hostname derived name is
+    // only a suggestion, and the server may hand back a numbered variant.
+    exact: bool,
     ephemeral: bool,
 ) -> Result<Issued, ExchangeError> {
     let body = serde_json::json!({
         "key": key,
         "node": node,
+        "exact": exact,
         "device": device,
         "name": name,
         "ephemeral": ephemeral,
@@ -746,11 +837,23 @@ pub async fn exchange(
 
     let issued: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
 
-    Ok(Issued {
-        token: issued["token"].as_str().unwrap_or_default().to_owned(),
-        device: issued["device"].as_str().unwrap_or_default().to_owned(),
-        ip: issued["ip"].as_str().unwrap_or_default().to_owned(),
-    })
+    Ok(Issued::read(&issued))
+}
+
+impl Issued {
+    fn read(body: &serde_json::Value) -> Issued {
+        Issued {
+            token: body["token"].as_str().unwrap_or_default().to_owned(),
+            device: body["device"].as_str().unwrap_or_default().to_owned(),
+            ip: body["ip"].as_str().unwrap_or_default().to_owned(),
+            // A server with no certificate to offer leaves this out, and the
+            // node falls back to checking an https control url the ordinary way.
+            ca: body["ca"]
+                .as_str()
+                .filter(|pem| !pem.is_empty())
+                .map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -822,4 +925,106 @@ pub async fn verify(api: &str, key: &str) -> Result<String, ExchangeError> {
     let body: serde_json::Value = response.json().await.map_err(ExchangeError::Malformed)?;
 
     Ok(body["account"].as_str().unwrap_or_default().to_owned())
+}
+
+/// A connection that may live on the mesh or on the host's own network.
+///
+/// The overlay only knows how to reach peers, so anything outside it has no
+/// route through our stack. Rather than dropping those packets and leaving the
+/// caller to time out, a name that is not on the mesh is dialled with ordinary
+/// host networking. Exit nodes would change this later.
+pub enum Stream {
+    Mesh(smolnet::net::tcp::TcpStream),
+    Host(tokio::net::TcpStream),
+}
+
+impl tokio::io::AsyncRead for Stream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Mesh(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Stream::Host(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Stream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Mesh(stream) => std::pin::Pin::new(stream).poll_write(cx, data),
+            Stream::Host(stream) => std::pin::Pin::new(stream).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Mesh(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Stream::Host(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Mesh(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Stream::Host(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Stream {
+    pub fn on_mesh(&self) -> bool {
+        matches!(self, Stream::Mesh(_))
+    }
+}
+
+/// Split `host:port`, where host may be a `.smol` name, a bare peer name, or an
+/// address.
+fn split_target(target: &str) -> Option<(&str, u16)> {
+    let (host, port) = target.rsplit_once(':')?;
+
+    Some((host, port.parse().ok()?))
+}
+
+#[cfg(test)]
+mod issued_test {
+    use crate::client::Issued;
+
+    #[test]
+    fn a_certificate_comes_back_with_the_token() {
+        let issued = Issued::read(&serde_json::json!({
+            "token": "jwt",
+            "device": "dev1",
+            "ip": "10.0.0.2",
+            "ca": "-----BEGIN CERTIFICATE-----",
+        }));
+
+        assert_eq!(issued.device, "dev1");
+        assert_eq!(issued.ca.as_deref(), Some("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn no_certificate_is_not_an_empty_one() {
+        for body in [
+            serde_json::json!({"token": "jwt", "device": "d", "ip": "10.0.0.2"}),
+            serde_json::json!({"token": "jwt", "device": "d", "ip": "10.0.0.2", "ca": ""}),
+        ] {
+            assert!(
+                Issued::read(&body).ca.is_none(),
+                "an absent certificate must not become a pin nothing can match"
+            );
+        }
+    }
 }

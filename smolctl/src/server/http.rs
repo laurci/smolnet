@@ -28,6 +28,9 @@ pub struct Console {
     pub public_url: String,
     pub assets: Option<PathBuf>,
     pub presence: broadcast::Sender<Presence>,
+    /// The control port's certificate, handed to a device along with its join
+    /// token so it has something to pin before it dials.
+    pub certificate: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +50,7 @@ impl Console {
         client_secret: String,
         public_url: String,
         assets: Option<PathBuf>,
+        certificate: String,
     ) -> (Arc<Console>, broadcast::Sender<Presence>) {
         let (presence, _) = broadcast::channel(256);
 
@@ -58,6 +62,7 @@ impl Console {
             public_url,
             assets,
             presence: presence.clone(),
+            certificate,
         });
 
         (console, presence)
@@ -406,6 +411,7 @@ pub struct TokenRequest {
     device: Option<String>,
     node: String,
     name: Option<String>,
+    exact: Option<bool>,
     ephemeral: Option<bool>,
 }
 
@@ -468,18 +474,18 @@ async fn issue_token(
     // caller asks for and always lands on the device it is bound to. A cli
     // session speaks for the account, so it may name, reuse, or throw away as
     // many devices as it likes.
+    let exact = body.exact.unwrap_or(true);
+    let ephemeral = body.ephemeral.unwrap_or(false);
+
     let wanted = if holder.session {
-        match (
-            body.device.as_deref(),
-            body.name.as_deref(),
-            body.ephemeral.unwrap_or(false),
-        ) {
-            (_, Some(name), true) => Wanted::Named(name),
-            (Some(device), Some(name), false) => Wanted::Rename { device, name },
-            (None, Some(name), false) => Wanted::Named(name),
-            (_, None, true) => Wanted::Throwaway,
-            (Some(device), None, false) => Wanted::Existing(device),
-            (None, None, false) => Wanted::Fresh,
+        match (body.device.as_deref(), body.name.as_deref()) {
+            (_, Some(name)) if ephemeral => Wanted::Named(name),
+            (Some(device), Some(name)) if exact => Wanted::Rename { device, name },
+            (_, Some(name)) if exact => Wanted::Named(name),
+            (_, Some(name)) => Wanted::Suggested(name),
+            (_, None) if ephemeral => Wanted::Throwaway,
+            (Some(device), None) => Wanted::Existing(device),
+            (None, None) => Wanted::Fresh,
         }
     } else {
         match holder.device.as_deref() {
@@ -525,6 +531,10 @@ async fn issue_token(
             "device": device.id,
             "ip": device.ip.to_string(),
             "expires": claims.exp,
+            // This request came over the console's own https, so it is the one
+            // channel a device can learn the control port's certificate from
+            // without having to trust the network it is about to dial over.
+            "ca": console.certificate,
         }))
         .into_response(),
         Err(e) => failed(e),

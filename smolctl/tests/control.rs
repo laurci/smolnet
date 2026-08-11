@@ -10,7 +10,7 @@ use smolmesh::{NetworkId, NodeId, Reflector};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::transport::{Server, ServerTlsConfig};
 
 const SECRET: &[u8] = b"a shared secret that only the control plane knows";
 const ECHO_PORT: u16 = 7777;
@@ -49,6 +49,89 @@ async fn control() -> Control {
     );
 
     Control { url }
+}
+
+/// The same control plane, but reached the way a real device reaches it.
+async fn secure_control(directory: &str) -> (Control, String) {
+    init_tracing();
+
+    let reflector = Reflector::bind("127.0.0.1:0").await.unwrap();
+    let advertise = reflector.local_addr().unwrap().to_string();
+    tokio::spawn(reflector.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+
+    let home = std::env::temp_dir().join(directory);
+    let _ = std::fs::remove_dir_all(&home);
+
+    let material = smolctl::server::tls::Material::load_or_create(&home).unwrap();
+    let certificate = material.certificate.clone();
+
+    let registry = Registry::new(DEFAULT_SUBNET, DEFAULT_NETMASK);
+    let service = ControlService::new(registry, SECRET.to_vec(), advertise);
+
+    tokio::spawn(
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(material.identity()))
+            .unwrap()
+            .add_service(service.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
+    (Control { url }, certificate)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_joins_over_tls_with_the_certificate_it_was_given() {
+    let (control, certificate) = secure_control("smol-control-tls-good").await;
+    let network = NetworkId::random();
+    let token = token_for(network, NodeId::random());
+
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        Session::join(
+            JoinConfig::new(control.url.clone(), token)
+                .bind("127.0.0.1:0".parse().unwrap())
+                .stun(vec![])
+                .ca(Some(certificate)),
+        ),
+    )
+    .await
+    .expect("the join finished")
+    .expect("the pinned certificate was accepted");
+
+    assert_eq!(session.membership().network, network);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_refuses_a_control_port_it_cannot_recognise() {
+    let (control, _) = secure_control("smol-control-tls-bad").await;
+
+    // Someone else's certificate: well formed, correctly named, and not the one
+    // the console handed this device.
+    let elsewhere = std::env::temp_dir().join("smol-control-tls-impostor");
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    let impostor = smolctl::server::tls::Material::load_or_create(&elsewhere).unwrap();
+
+    let token = token_for(NetworkId::random(), NodeId::random());
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        Session::join(
+            JoinConfig::new(control.url.clone(), token)
+                .bind("127.0.0.1:0".parse().unwrap())
+                .stun(vec![])
+                .ca(Some(impostor.certificate)),
+        ),
+    )
+    .await
+    .expect("the join finished rather than hanging");
+
+    assert!(
+        outcome.is_err(),
+        "a control port that cannot show the pinned certificate must not be joined"
+    );
 }
 
 fn token_for(network: NetworkId, node: NodeId) -> String {
@@ -444,4 +527,23 @@ async fn a_node_rides_out_a_control_server_restart() {
     );
 
     running.abort();
+}
+
+#[test]
+fn a_target_splits_into_host_and_port() {
+    // exercised through connect, but the parsing is worth pinning on its own
+    for (target, ok) in [
+        ("laptop.smol:8080", true),
+        ("laptop:22", true),
+        ("10.1.2.3:443", true),
+        ("ntp.google.com:123", true),
+        ("laptop.smol", false),
+        ("laptop.smol:notaport", false),
+    ] {
+        let parsed = target
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)));
+
+        assert_eq!(parsed.is_some(), ok, "{target}");
+    }
 }

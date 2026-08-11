@@ -42,6 +42,8 @@ message Welcome {
   string ip = 3;
   string device = 7;
   string hostname = 8;
+  string name = 9;
+  string zone = 10;
   string netmask = 4;
   string reflector = 5;
   repeated PeerState peers = 6;
@@ -53,6 +55,8 @@ message PeerState {
   repeated string endpoints = 3;
   bool online = 4;
   string public_key = 5;
+  // the device's unique name; <name>.smol resolves to its overlay address
+  string name = 6;
 }
 
 message PeerGone {

@@ -16,6 +16,8 @@ pub struct Membership {
     pub ip: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub peers: Vec<Peer>,
+    /// This device's unique name, so it can answer for itself under the zone.
+    pub name: Option<String>,
 }
 
 impl Membership {
@@ -26,6 +28,7 @@ impl Membership {
             ip,
             netmask: DEFAULT_NETMASK,
             peers: vec![],
+            name: None,
         }
     }
 
@@ -36,6 +39,11 @@ impl Membership {
 
     pub fn with_peer(mut self, peer: Peer) -> Membership {
         self.peers.push(peer);
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Membership {
+        self.name = Some(name.into());
         self
     }
 

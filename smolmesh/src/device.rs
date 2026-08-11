@@ -27,6 +27,11 @@ pub const MESH_MTU: usize = 1280;
 /// memory.
 const QUEUE_DEPTH: usize = 16;
 
+/// How many of a peer's published addresses to try at once. Enough to cover a
+/// public address, a nat reflection and a local one, without turning a single
+/// dropped packet into a burst.
+const HANDSHAKE_FANOUT: usize = 4;
+
 pub const MESH_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
 pub const MAX_DATAGRAM_SIZE: usize = HEADER_SIZE + MESH_MTU;
@@ -221,6 +226,11 @@ impl MeshDevice {
         self.peers.clone()
     }
 
+    /// Shorten how long a session lives before it is replaced.
+    pub fn rekey_after(&mut self, after: std::time::Duration) {
+        self.sessions.rekey_after(after);
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -386,7 +396,16 @@ impl MeshDevice {
                     return Err(Discard::HandshakeRefused);
                 }
 
-                tracing::info!(peer = %datagram.sender, ip = %peer.ip, "session established");
+                // The reply came back from whichever candidate could actually
+                // carry it, which is now the address we should be using.
+                self.member(&datagram.sender, from).ok();
+
+                tracing::info!(
+                    peer = %datagram.sender,
+                    ip = %peer.ip,
+                    endpoint = %from,
+                    "session established"
+                );
 
                 Ok(Handled::Ready(key, from))
             }
@@ -436,6 +455,21 @@ impl MeshDevice {
             return;
         };
 
+        // A peer publishes every address it might be reachable at, and only it
+        // knows which one works from here: a peer behind our own nat, or on this
+        // machine, is unreachable at the public address stun handed it. Ask at
+        // all of them at once and keep whichever answers.
+        let mut targets = match self.peers.by_key(&key) {
+            Some(peer) => peer.reachable_at(),
+            None => vec![],
+        };
+
+        if !targets.contains(&endpoint) {
+            targets.insert(0, endpoint);
+        }
+
+        targets.truncate(HANDSHAKE_FANOUT);
+
         let mut payload = Vec::with_capacity(4 + message.len());
         payload.extend_from_slice(&index.to_be_bytes());
         payload.extend_from_slice(&message);
@@ -452,10 +486,17 @@ impl MeshDevice {
         }
 
         let size = datagram.write(&mut self.tx);
+        let mut asked = vec![];
 
-        match self.socket.try_send_to(&self.tx[..size], endpoint) {
-            Ok(_) => tracing::info!(%endpoint, "asked a peer for a session"),
-            Err(e) => tracing::debug!(%endpoint, "could not start a handshake: {e}"),
+        for target in targets {
+            match self.socket.try_send_to(&self.tx[..size], target) {
+                Ok(_) => asked.push(target),
+                Err(e) => tracing::debug!(endpoint = %target, "could not start a handshake: {e}"),
+            }
+        }
+
+        if !asked.is_empty() {
+            tracing::info!(candidates = ?asked, "asked a peer for a session");
         }
     }
 
@@ -474,6 +515,15 @@ impl MeshDevice {
                 need: header + packet.len() + crate::session::TAG_SIZE,
                 got: self.tx.len(),
             });
+        }
+
+        // A session that has run its course is replaced before it is a problem.
+        // The handshake happens alongside the traffic: this packet, and every
+        // one until the peer answers, still goes out under the current session.
+        if self.sessions.needs_rekey(&key) {
+            tracing::debug!(%endpoint, "session is due for a rekey");
+
+            self.start_handshake(key, endpoint);
         }
 
         let Some(session) = self.sessions.established(&key) else {
