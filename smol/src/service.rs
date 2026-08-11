@@ -13,7 +13,7 @@ impl Service {
         })
     }
 
-    fn stash(&self, control: &str, token: &str, device: Option<&str>) -> Result<(), Box<dyn Error>> {
+    fn stash(&self, control: &str, token: &str) -> Result<(), Box<dyn Error>> {
         let staged = std::env::temp_dir().join("smol-config.toml");
 
         let config = crate::config::Config {
@@ -35,14 +35,14 @@ impl Service {
 
         std::fs::remove_file(&staged).ok();
 
-        // Hand the daemon the device this person already signed in as, so a
-        // machine does not turn up twice. Once it has one of its own it keeps
-        // it, and this never has anything to say again.
-        if let Some(device) = device
-            && crate::config::known_device(true).is_none()
+        // The daemon runs as root and cannot see the home directory the person
+        // signed in from, so hand its copy of this machine's device across once.
+        // After its first start the daemon keeps its own and this says nothing.
+        if crate::config::known_device_at(true).is_none()
+            && let Some(device) = crate::config::known_device_at(false)
         {
             let staged = std::env::temp_dir().join("smol-device");
-            std::fs::write(&staged, device)?;
+            std::fs::write(&staged, &device)?;
 
             elevated(&[
                 "install",
@@ -109,13 +109,8 @@ mod platform {
     }
 
     impl Service {
-        pub fn install(
-            &self,
-            control: &str,
-            token: &str,
-            device: Option<&str>,
-        ) -> Result<(), Box<dyn Error>> {
-            self.stash(control, token, device)?;
+        pub fn install(&self, control: &str, token: &str) -> Result<(), Box<dyn Error>> {
+            self.stash(control, token)?;
 
             let text = unit_text(&self.binary, "");
             let staged = std::env::temp_dir().join("smol.service");
@@ -221,13 +216,8 @@ mod platform {
     }
 
     impl Service {
-        pub fn install(
-            &self,
-            control: &str,
-            token: &str,
-            device: Option<&str>,
-        ) -> Result<(), Box<dyn Error>> {
-            self.stash(control, token, device)?;
+        pub fn install(&self, control: &str, token: &str) -> Result<(), Box<dyn Error>> {
+            self.stash(control, token)?;
 
             let staged = std::env::temp_dir().join(format!("{LABEL}.plist"));
             std::fs::write(&staged, plist_text(&self.binary))?;
@@ -306,7 +296,7 @@ mod platform {
     use super::{Error, Service};
 
     impl Service {
-        pub fn install(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), Box<dyn Error>> {
+        pub fn install(&self, _: &str, _: &str) -> Result<(), Box<dyn Error>> {
             Err("smol only manages services on linux and macos".into())
         }
 

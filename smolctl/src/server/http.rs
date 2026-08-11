@@ -516,6 +516,7 @@ async fn issue_token(
             "token": jwt,
             "device": device.id,
             "ip": device.ip.to_string(),
+            "name": device.name.clone().unwrap_or_default(),
             "expires": claims.exp,
             // This request came over the console's own https, so it is the one
             // channel a device can learn the control port's certificate from

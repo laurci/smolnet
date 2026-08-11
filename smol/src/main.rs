@@ -208,34 +208,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let account = smolctl::client::verify(&control, &key).await?;
 
-            let chosen = args.name.is_some();
+            config.key = key.clone();
+            config::save(&config)?;
 
-            let name = args
-                .name
-                .or_else(smolctl::client::discovered_hostname)
-                .unwrap_or_else(|| "unnamed".to_owned());
-
+            // Signing in for the first time is when this machine becomes a
+            // device, which is worth seeing happen. After that it already is
+            // one: say which, and create nothing.
+            let known = config::known_device();
             let node = smolmesh::NodeId::random().to_string();
+
+            // The name always travels: as a demand when asked for by hand, and
+            // otherwise as what to fall back to should this device be gone from
+            // under us, so a machine comes back as itself and not as nobody.
+            let name = args.name.clone().or_else(smolctl::client::discovered_hostname);
 
             let issued = smolctl::client::exchange(
                 &control,
                 &key,
                 &node,
-                config::known_device(false).as_deref(),
-                Some(&name),
-                chosen,
+                known.as_deref(),
+                name.as_deref(),
+                args.name.is_some(),
                 false,
             )
             .await?;
 
-            config.key = key;
-
-            config::save(&config)?;
-            config::remember_device(false, &issued.device)?;
+            if known.is_none() {
+                config::remember_device(false, &issued.device)?;
+            }
 
             println!();
             println!("signed in as {account}");
-            println!("this machine is {} at {}", name, issued.ip);
+            println!(
+                "this machine {} {} at {}",
+                if known.is_none() { "joined as" } else { "is" },
+                issued.name,
+                issued.ip
+            );
             println!("saved to {}", config::path().display());
             println!();
             println!("now run: sudo smol start");
@@ -245,11 +254,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let config = config::resolve(args.control, args.token)?;
             let service = Service::located()?;
 
-            service.install(
-                &config.control,
-                &config.key,
-                config::known_device(false).as_deref(),
-            )?;
+            service.install(&config.control, &config.key)?;
             service.start()?;
 
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -295,17 +300,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let config = config::resolve(args.control, args.token)?;
 
             let node_id = smolmesh::NodeId::random().to_string();
-            let device = config::known_device(true);
+            let device = config::known_device();
 
-            // With a device of its own the name is settled and never resent. On
-            // a machine that has none, offer what the machine calls itself so
-            // the first start lands on a named device rather than an anonymous
-            // one; `--name` makes that a demand rather than a suggestion.
-            let chosen = args.name.is_some();
-            let name = args
-                .name
-                .clone()
-                .or_else(|| device.is_none().then(smolctl::client::discovered_hostname).flatten());
+            // A name asked for by hand is a demand, and a rename takes effect.
+            // Otherwise what the machine calls itself is a suggestion: it names
+            // a first start, and stands as the fallback if this device is ever
+            // deleted, so the machine returns as itself rather than as nobody.
+            let name = args.name.clone().or_else(smolctl::client::discovered_hostname);
 
             let issued = smolctl::client::exchange(
                 &config.control,
@@ -313,7 +314,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &node_id,
                 device.as_deref(),
                 name.as_deref(),
-                chosen,
+                args.name.is_some(),
                 false,
             )
             .await?;

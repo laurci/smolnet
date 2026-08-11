@@ -104,12 +104,21 @@ pub fn keys_dir(system: bool) -> PathBuf {
 /// and never edited by hand. Whoever exchanges a key for a token is told which
 /// device they got, and writes it here, so the next start asks for that same
 /// device instead of a new one.
-pub fn known_device(system: bool) -> Option<String> {
-    read_device(&state_dir(system))
+/// What device this machine already is, wherever it was written down: the
+/// daemon's copy under /etc first, then the one a person's own login left.
+///
+/// There is one answer, from one order, for every command. Two places to look
+/// is a storage detail; two identities would be a bug, and was.
+pub fn known_device() -> Option<String> {
+    read_device(&state_dir(true)).or_else(|| read_device(&state_dir(false)))
 }
 
 pub fn remember_device(system: bool, device: &str) -> Result<(), Box<dyn Error>> {
     write_device(&state_dir(system), device)
+}
+
+pub fn known_device_at(system: bool) -> Option<String> {
+    read_device(&state_dir(system))
 }
 
 pub fn read_device(directory: &Path) -> Option<String> {

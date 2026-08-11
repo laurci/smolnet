@@ -796,6 +796,9 @@ pub struct Issued {
     pub token: String,
     pub device: String,
     pub ip: String,
+    /// What the server settled on calling this device, which is not always what
+    /// the caller suggested.
+    pub name: String,
     pub ca: Option<String>,
 }
 
@@ -846,6 +849,7 @@ impl Issued {
             token: body["token"].as_str().unwrap_or_default().to_owned(),
             device: body["device"].as_str().unwrap_or_default().to_owned(),
             ip: body["ip"].as_str().unwrap_or_default().to_owned(),
+            name: body["name"].as_str().unwrap_or_default().to_owned(),
             // A server with no certificate to offer leaves this out, and the
             // node falls back to checking an https control url the ordinary way.
             ca: body["ca"]
@@ -1013,6 +1017,16 @@ mod issued_test {
 
         assert_eq!(issued.device, "dev1");
         assert_eq!(issued.ca.as_deref(), Some("-----BEGIN CERTIFICATE-----"));
+
+        let named = Issued::read(&serde_json::json!({
+            "device": "dev1",
+            "name": "laptop-1",
+        }));
+
+        assert_eq!(
+            named.name, "laptop-1",
+            "the name the server settled on, not the one that was asked for"
+        );
     }
 
     #[test]

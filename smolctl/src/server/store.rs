@@ -1124,6 +1124,42 @@ mod test {
     }
 
     #[tokio::test]
+    async fn a_machine_returns_under_its_own_name_after_its_device_is_deleted() {
+        let store = store().await;
+        let owner = owner(&store).await;
+        let network = network(&store, &owner).await;
+
+        let first = store
+            .resolve_device(&owner, &network, Wanted::Suggested("laptop"), "node-a")
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM devices WHERE id = ?1")
+            .bind(&first.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // The machine still asks for the device it was, and is told it is gone.
+        let back = store
+            .resolve_device(
+                &owner,
+                &network,
+                Wanted::Existing { device: &first.id, fallback: Some("laptop") },
+                "node-a",
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(back.id, first.id, "it is a new row");
+        assert_eq!(
+            back.name.as_deref(),
+            Some("laptop"),
+            "but the machine comes back as itself, not as an unnamed device"
+        );
+    }
+
+    #[tokio::test]
     async fn an_explicit_name_reuses_the_device_instead_of_stepping_aside() {
         let store = store().await;
         let owner = owner(&store).await;
