@@ -693,6 +693,12 @@ impl Supervisor {
 
         let real = unsafe { OwnedFd::from_raw_fd(real) };
 
+        // Everything the target set, it set on the socket we were pretending to
+        // be. The kernel one it is about to get knows none of it, and a target
+        // that asked for a non blocking socket and is handed a blocking one
+        // waits forever in a read it expected EAGAIN from.
+        self.carry_over(fd, real.as_fd());
+
         notify::add_fd(
             self.listener.as_fd(),
             NotifAddfd {
@@ -806,6 +812,76 @@ impl Supervisor {
         });
 
         Ok(())
+    }
+
+    /// Move the target's view of a socket onto the real one replacing it.
+    fn carry_over(&self, fd: i32, real: BorrowedFd<'_>) {
+        let Some(socket) = self.sockets.get(&fd) else {
+            return;
+        };
+
+        for ((level, option), value) in &socket.options {
+            let result = unsafe {
+                libc::setsockopt(
+                    real.as_raw_fd(),
+                    *level,
+                    *option,
+                    value as *const i32 as *const libc::c_void,
+                    size_of::<i32>() as libc::socklen_t,
+                )
+            };
+
+            if result != 0 {
+                tracing::debug!(fd, level, option, "could not carry over a socket option");
+            }
+        }
+
+        for (option, timeout) in [
+            (libc::SO_RCVTIMEO, socket.timeouts.0),
+            (libc::SO_SNDTIMEO, socket.timeouts.1),
+        ] {
+            let Some(timeout) = timeout else {
+                continue;
+            };
+
+            let value = libc::timeval {
+                tv_sec: timeout.as_secs() as libc::time_t,
+                tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+            };
+
+            unsafe {
+                libc::setsockopt(
+                    real.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    &value as *const libc::timeval as *const libc::c_void,
+                    size_of::<libc::timeval>() as libc::socklen_t,
+                );
+            }
+        }
+
+        if self.is_nonblocking(fd) && let Err(e) = set_nonblocking(real) {
+            tracing::debug!(fd, "could not carry over the non blocking flag: {e}");
+        }
+    }
+
+    /// Whether the target has this descriptor in non blocking mode. A fresh
+    /// kernel socket is blocking, so anything we cannot establish stays that way.
+    fn is_nonblocking(&self, fd: i32) -> bool {
+        if let Some(socket) = self.sockets.get(&fd)
+            && socket.observed_flags
+        {
+            return !socket.blocking;
+        }
+
+        std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", self.current))
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|value| i32::from_str_radix(value.trim(), 8).ok())
+            })
+            .is_some_and(|flags| flags & libc::O_NONBLOCK != 0)
     }
 
     fn is_blocking(&self, fd: i32) -> bool {
