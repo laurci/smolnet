@@ -17,9 +17,6 @@ pub struct Config {
 
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key: String,
-
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub device: String,
 }
 
 impl Config {
@@ -40,9 +37,6 @@ impl Config {
         (!self.mesh.is_empty()).then(|| format!("https://{}", self.mesh))
     }
 
-    pub fn device(&self) -> Option<&str> {
-        (!self.device.is_empty()).then_some(self.device.as_str())
-    }
 }
 
 fn home_of(user: &str) -> Option<PathBuf> {
@@ -84,18 +78,60 @@ pub fn daemon_path() -> PathBuf {
     PathBuf::from(SYSTEM_DIR).join("daemon.toml")
 }
 
-/// Where a device's long term mesh key lives. The daemon keeps its keys under
-/// /etc so it does not depend on any one user's home directory being readable
-/// at boot; everything a person runs keeps them beside their own config.
-pub fn keys_dir(system: bool) -> PathBuf {
+/// Where this machine keeps what it is, as opposed to how it is configured.
+///
+/// The daemon keeps its state under /etc so it does not depend on any one
+/// user's home directory being readable at boot; everything a person runs keeps
+/// state beside their own config.
+pub fn state_dir(system: bool) -> PathBuf {
     if system {
-        return PathBuf::from(SYSTEM_DIR).join("keys");
+        return PathBuf::from(SYSTEM_DIR);
     }
 
     match home() {
-        Some(home) => home.join(".config/smol/keys"),
-        None => PathBuf::from(SYSTEM_DIR).join("keys"),
+        Some(home) => home.join(".config/smol"),
+        None => PathBuf::from(SYSTEM_DIR),
     }
+}
+
+pub fn keys_dir(system: bool) -> PathBuf {
+    state_dir(system).join("keys")
+}
+
+/// The device this machine is, as the control server named it.
+///
+/// This is identity, not configuration: it is never merged from several files
+/// and never edited by hand. Whoever exchanges a key for a token is told which
+/// device they got, and writes it here, so the next start asks for that same
+/// device instead of a new one.
+pub fn known_device(system: bool) -> Option<String> {
+    read_device(&state_dir(system))
+}
+
+pub fn remember_device(system: bool, device: &str) -> Result<(), Box<dyn Error>> {
+    write_device(&state_dir(system), device)
+}
+
+pub fn read_device(directory: &Path) -> Option<String> {
+    let found = std::fs::read_to_string(directory.join("device")).ok()?;
+    let found = found.trim().to_owned();
+
+    (!found.is_empty()).then_some(found)
+}
+
+pub fn write_device(directory: &Path, device: &str) -> Result<(), Box<dyn Error>> {
+    // The server always answers with a device; an empty answer would mean the
+    // exchange failed, and must not erase what this machine already is.
+    if device.is_empty() || read_device(directory).as_deref() == Some(device) {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(directory)?;
+    std::fs::write(directory.join("device"), device)?;
+
+    tracing::info!(device, "this machine is now that device");
+
+    Ok(())
 }
 
 /// The key pair that identifies a device on the mesh, made once and then kept.
@@ -141,7 +177,6 @@ impl Config {
             (&mut self.control, other.control),
             (&mut self.mesh, other.mesh),
             (&mut self.key, other.key),
-            (&mut self.device, other.device),
         ] {
             if !value.is_empty() {
                 *slot = value;
@@ -215,7 +250,7 @@ pub fn resolve(control: Option<String>, key: Option<String>) -> Result<Config, B
 mod test {
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::config::{Config, keys_in};
+    use crate::config::{Config, keys_in, read_device, write_device};
 
     #[test]
     fn a_config_round_trips_through_toml() {
@@ -223,7 +258,6 @@ mod test {
             control: "https://example.com/api".to_owned(),
             mesh: "example.com:54189".to_owned(),
             key: "smol_abc".to_owned(),
-            device: "dev123".to_owned(),
         };
 
         let parsed = Config::parse(&config.render()).unwrap();
@@ -234,7 +268,40 @@ mod test {
             Some("https://example.com:54189"),
             "the control port is never dialled in the clear"
         );
-        assert_eq!(parsed.device(), Some("dev123"));
+    }
+
+    #[test]
+    fn a_machine_remembers_which_device_it_is() {
+        let home = std::env::temp_dir().join(format!("smol-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(read_device(&home), None, "a machine starts out as nobody");
+
+        write_device(&home, "dev123").unwrap();
+
+        assert_eq!(
+            read_device(&home).as_deref(),
+            Some("dev123"),
+            "and the next start asks for that device rather than a new one"
+        );
+    }
+
+    #[test]
+    fn being_told_a_different_device_replaces_the_old_one() {
+        let home = std::env::temp_dir().join(format!("smol-id2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        write_device(&home, "first").unwrap();
+        write_device(&home, "second").unwrap();
+
+        assert_eq!(read_device(&home).as_deref(), Some("second"));
+
+        // An empty answer is not an answer; it must not erase what we know.
+        write_device(&home, "").unwrap();
+
+        assert_eq!(read_device(&home).as_deref(), Some("second"));
     }
 
     #[test]
@@ -281,7 +348,6 @@ mod test {
         let parsed = Config::parse(text).unwrap();
 
         assert!(parsed.key.is_empty());
-        assert_eq!(parsed.device(), None, "no device until the server names one");
     }
 
     #[test]
@@ -295,7 +361,10 @@ mod test {
         let rendered = config.render();
 
         assert!(!rendered.contains("key"), "an empty key is not written at all");
-        assert!(!rendered.contains("device"));
+        assert!(
+            !rendered.contains("device"),
+            "identity is state the daemon writes, never config anyone edits"
+        );
     }
 
     #[test]
@@ -308,7 +377,6 @@ mod test {
 
         config.overlay(Config {
             key: "smol_mine".to_owned(),
-            device: "mine".to_owned(),
             ..Config::default()
         });
 

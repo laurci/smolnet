@@ -221,7 +221,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &control,
                 &key,
                 &node,
-                config.device(),
+                config::known_device(false).as_deref(),
                 Some(&name),
                 chosen,
                 false,
@@ -229,9 +229,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
 
             config.key = key;
-            config.device = issued.device.clone();
 
             config::save(&config)?;
+            config::remember_device(false, &issued.device)?;
 
             println!();
             println!("signed in as {account}");
@@ -245,7 +245,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let config = config::resolve(args.control, args.token)?;
             let service = Service::located()?;
 
-            service.install(&config.control, &config.key, &config.device)?;
+            service.install(
+                &config.control,
+                &config.key,
+                config::known_device(false).as_deref(),
+            )?;
             service.start()?;
 
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -291,17 +295,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let config = config::resolve(args.control, args.token)?;
 
             let node_id = smolmesh::NodeId::random().to_string();
+            let device = config::known_device(true);
+
+            // With a device of its own the name is settled and never resent. On
+            // a machine that has none, offer what the machine calls itself so
+            // the first start lands on a named device rather than an anonymous
+            // one; `--name` makes that a demand rather than a suggestion.
+            let chosen = args.name.is_some();
+            let name = args
+                .name
+                .clone()
+                .or_else(|| device.is_none().then(smolctl::client::discovered_hostname).flatten());
 
             let issued = smolctl::client::exchange(
                 &config.control,
                 &config.key,
                 &node_id,
-                config.device(),
-                args.name.as_deref(),
-                true,
+                device.as_deref(),
+                name.as_deref(),
+                chosen,
                 false,
             )
             .await?;
+
+            config::remember_device(true, &issued.device)?;
 
             let mesh = config
                 .mesh_url()
